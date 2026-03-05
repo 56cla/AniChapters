@@ -46,6 +46,7 @@ class Application:
         self.videos: list[str] = []
         self.themes: list[Theme] = []
         self.results: list[AnalysisResult] = []
+        self.anime_name: str = ""
         self.busy = False
         self.inplace = tk.BooleanVar(value=False)
         self.cancel_event: Optional[threading.Event] = None
@@ -563,7 +564,8 @@ class Application:
 
     def _on_themes_loaded(self, themes: list[Theme], anime_name: str):
         """Handle themes loaded successfully"""
-        self.themes = themes
+        self.themes     = themes
+        self.anime_name = anime_name          # passed to core.py as search_name
         self.theme_label.config(text=f"✔ {anime_name}", fg=A2)
         self._log(f"\nReady — click 'Analyze All'\n\n", "ok")
         self._set_busy(False)
@@ -603,6 +605,7 @@ class Application:
                         themes,
                         log_func=self._log_async,
                         cancel_event=self.cancel_event,
+                        search_name=self.anime_name,
                     )
 
                     if self.cancel_event.is_set():
@@ -826,34 +829,15 @@ class Application:
     # ─── Cache / log utilities ────────────────────────────────────────────────
 
     def _clear_cache(self):
-        """Clean up temporary directories"""
+        """Clean up temporary directories and downloaded themes"""
         import glob
         import tempfile
 
         deleted = 0
         freed   = 0
 
-        # Clean tracked temp dirs
-        for dir_path in list(_TEMP_DIRS):
-            if os.path.exists(dir_path):
-                try:
-                    size = sum(
-                        os.path.getsize(os.path.join(dp, f))
-                        for dp, _, files in os.walk(dir_path)
-                        for f in files
-                    )
-                    shutil.rmtree(dir_path, ignore_errors=True)
-                    freed   += size
-                    deleted += 1
-                except Exception:
-                    pass
-
-            if dir_path in _TEMP_DIRS:
-                _TEMP_DIRS.remove(dir_path)
-
-        # Clean any remaining animechap_* dirs
-        tmp_dir = tempfile.gettempdir()
-        for dir_path in glob.glob(os.path.join(tmp_dir, "animechap_*")):
+        def _del_dir(dir_path):
+            nonlocal deleted, freed
             if os.path.isdir(dir_path):
                 try:
                     size = sum(
@@ -867,11 +851,32 @@ class Application:
                 except Exception:
                     pass
 
+        # Clean tracked temp dirs
+        for dir_path in list(_TEMP_DIRS):
+            _del_dir(dir_path)
+            if dir_path in _TEMP_DIRS:
+                _TEMP_DIRS.remove(dir_path)
+
+        # Clean any remaining animechap_* dirs in system temp
+        tmp_dir = tempfile.gettempdir()
+        for dir_path in glob.glob(os.path.join(tmp_dir, "animechap_*")):
+            _del_dir(dir_path)
+
+        # Clean the hidden themes cache (~/.animechap_themes or %APPDATA%\.animechap_themes)
+        if os.name == "nt":
+            _base = os.environ.get("APPDATA", os.path.expanduser("~"))
+        else:
+            _base = os.path.expanduser("~")
+        themes_cache = os.path.join(_base, ".animechap_themes")
+        if os.path.isdir(themes_cache):
+            _del_dir(themes_cache)
+            self._log(f"Deleted themes cache: {themes_cache}\n", "dim")
+
         mb = freed / (1024 * 1024)
         if deleted:
-            self._log(f"Deleted {deleted} temp dirs ({mb:.1f} MB)\n", "ok")
+            self._log(f"Deleted {deleted} dir(s) ({mb:.1f} MB freed)\n", "ok")
         else:
-            self._log("No temp files to clean.\n", "dim")
+            self._log("No cache to clean.\n", "dim")
 
     def _copy_log(self):
         """Copy log content to clipboard"""
