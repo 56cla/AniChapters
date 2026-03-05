@@ -37,7 +37,7 @@ class Application:
 
     def __init__(self, root: "tk.Tk"):
         self.root = root
-        root.title("Anime Chapters Generator  v9.0")
+        root.title("AniChapters")
         root.geometry("820x720")
         root.configure(bg=BG)
         root.resizable(True, True)
