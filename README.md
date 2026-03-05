@@ -1,4 +1,5 @@
-<img width="1916" height="1006" alt="image" src="https://github.com/user-attachments/assets/ce2baa1f-cb72-4640-a7f0-35b9c20e8e5a" />
+<img width="823" height="757" alt="{A20A2649-1E2E-432D-B8AB-443A55C0C202}" src="https://github.com/user-attachments/assets/b159e4a9-a3af-4f7b-a80c-1db9ba2cf528" />
+
 # AniChapters
 
 AniChapters is a desktop tool that automatically detects anime Opening (OP) and Ending (ED) segments and generates MKV chapters for anime episodes.
