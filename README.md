@@ -2,73 +2,78 @@
 
 # AniChapters
 
-AniChapters is a desktop tool that automatically detects anime Opening (OP) and Ending (ED) segments and generates MKV chapters for anime episodes.
+Automatic anime OP/ED detection and MKV chapter generator.
 
-The program analyzes the audio of your local video files and automatically creates chapter timestamps.
+AniChapters analyzes the audio of your local anime episodes, detects the Opening and Ending segments, and generates MKV-compatible chapter files automatically.
 
 ---
 
 ## Features
 
-* Automatic OP/ED detection
-* MKV chapter XML generation
-* Chapter review before export
-* Merge chapters into MKV files
-* Optional in-place editing using mkvpropedit
-* animethemes.moe integration
+- Automatic OP/ED detection using audio correlation
+- Fetches theme songs directly from [animethemes.moe](https://animethemes.moe)
+- Generates MKV-compatible XML chapter files
+- Chapter review and manual editing before export
+- Merge chapters into MKV files via mkvmerge
+- Optional in-place editing using mkvpropedit
+- Theme cache per series for faster re-analysis
+- Batch processing for multiple episodes at once
 
 ---
 
 ## Download
 
-Download the latest version from the **Releases** page.
+Download the latest release from the [Releases](../../releases) page.  
+Extract the ZIP and run **AniChapters.exe** — no installation required.
 
 ---
 
-## How to use
+## How to Use
 
-1. Extract the downloaded ZIP file
-2. Run **AniChapters.exe**
-3. Click **Add…** and select your anime episodes
-4. Click **Search & Fetch…** to load themes from animethemes.moe
-5. Click **Analyze All**
-6. Review detected chapters
-7. Click **Merge MKV**
+1. Run **AniChapters.exe**
+2. Click **Add…** and select your anime episodes
+3. Click **Search & Fetch…** and select your anime from the results
+4. Click **Analyze All** and wait for detection to finish
+5. Click **Review** to check and edit the detected chapters
+6. Click **Merge MKV** to embed chapters into your video files
 
 ---
 
 ## Requirements
 
-External tools (must be installed or included in the release):
+The following external tools must be available in your system PATH or placed in the same folder as the exe:
 
-**FFmpeg**
+| Tool | Required | Purpose |
+|------|----------|---------|
+| ffmpeg | ✅ Yes | Audio extraction |
+| ffprobe | ✅ Yes | Video metadata |
+| mkvmerge | ✅ Yes | Chapter merging |
+| mkvpropedit | ⬜ Optional | In-place chapter editing |
 
-* ffmpeg
-* ffprobe
+**FFmpeg** → [ffmpeg.org](https://ffmpeg.org/download.html)  
+**MKVToolNix** (includes mkvmerge + mkvpropedit) → [mkvtoolnix.download](https://mkvtoolnix.download)
 
-**MKVToolNix**
+---
 
-* mkvmerge
-* mkvpropedit (optional)
+## Running from Source
+
+```bash
+git clone https://github.com/56cla/AniChapters
+cd AniChapters
+pip install -r Requirements.txt
+python main.py
+```
 
 ---
 
 ## Notes
 
-Some shows may require manual review if OP/ED differs between episodes.
-
----
-
-## Disclaimer
-
-AniChapters does **not download anime**.
-It only analyzes video files that you already have.
+- Themes are cached in a `.themes` folder next to your video files. Use **Clear Cache** in the app to delete them.
+- Some episodes may require manual review if the OP/ED differs between episodes.
+- AniChapters does **not** download anime — it only analyzes video files you already have.
 
 ---
 
 ## License
 
 MIT License
-
-
-MIT
