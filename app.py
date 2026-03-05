@@ -31,13 +31,16 @@ try:
 except ImportError:
     GUI_AVAILABLE = False
 
+CURRENT_VERSION = "2.0"
+GITHUB_REPO     = "56cla/AniChapters"
+
 
 class Application:
     """Main application class"""
 
     def __init__(self, root: "tk.Tk"):
         self.root = root
-        root.title("AniChapters")
+        root.title(f"Anime Chapters Generator  {CURRENT_VERSION}")
         root.geometry("820x720")
         root.configure(bg=BG)
         root.resizable(True, True)
@@ -53,6 +56,7 @@ class Application:
 
         self._build_ui()
         self._check_dependencies()
+        threading.Thread(target=self._check_for_updates, daemon=True).start()
 
     # ─── UI construction ──────────────────────────────────────────────────────
 
@@ -368,6 +372,38 @@ class Application:
         self._log("Ready.\n", "dim")
 
     # ─── Logging helpers ──────────────────────────────────────────────────────
+
+    # ─── Update checker ───────────────────────────────────────────────────────
+
+    def _check_for_updates(self):
+        """Check GitHub for a newer release (runs in background thread)."""
+        import json
+        import urllib.request
+        try:
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+            req = urllib.request.Request(url, headers={"User-Agent": "AniChapters"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode())
+            latest = data.get("tag_name", "").strip()
+            if latest and latest != CURRENT_VERSION:
+                self.root.after(0, self._show_update_popup, latest, data.get("html_url", ""))
+            else:
+                self.root.after(0, self._log, f"Version {CURRENT_VERSION} — up to date.\n", "dim")
+        except Exception:
+            pass  # silent fail — no internet or API error
+
+    def _show_update_popup(self, latest: str, url: str):
+        """Show update notification dialog."""
+        import webbrowser
+        self._log(f"\n⚡ Update available: {latest} (current: {CURRENT_VERSION})\n", "ok")
+        if messagebox.askyesno(
+            "Update Available",
+            f"A new version is available!\n\n"
+            f"  Current:  {CURRENT_VERSION}\n"
+            f"  Latest:   {latest}\n\n"
+            f"Open the download page?",
+        ):
+            webbrowser.open(url)
 
     def _log(self, message: str, tag: str = "dim"):
         self.log_text.insert(tk.END, message, tag)
