@@ -24,6 +24,7 @@ from episode import extract_episode_number
 from ffprobe_utils import get_video_duration_ms
 from models import AnalysisResult, Chapter, MatchSource, Theme
 from timestamps import ms_to_display, timestamp_to_ms
+from shared_db import compute_confidence, get_shared_db
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -153,6 +154,49 @@ def _chapters_to_analysis_result(
     return result
 
 
+
+
+def _result_from_cached_chapters(
+    video_path: str,
+    chapters: list[Chapter],
+    xml_path: str,
+    video_duration_ms: Optional[int],
+) -> AnalysisResult:
+    """
+    Build an AnalysisResult from chapters loaded from the Shared Database.
+
+    Returns an AnalysisResult with op_source / ed_source = AUDIO
+    so the chapters are treated as reliable results elsewhere in the program.
+    """
+    basename = os.path.basename(video_path)
+    episode  = extract_episode_number(video_path)
+
+    result = AnalysisResult(
+        video_path=video_path,
+        basename=basename,
+        episode=episode,
+        video_duration_ms=video_duration_ms,
+        xml_path=xml_path,
+        chapters=chapters,
+    )
+
+    # Infer op/ed timings from known chapter names
+    name_map = {ch.name.lower(): ch.timestamp_ms for ch in chapters}
+
+    if "opening" in name_map:
+        result.op_start_ms = name_map["opening"]
+        result.op_source   = MatchSource.AUDIO
+        if "episode" in name_map:
+            result.op_end_ms = name_map["episode"]
+
+    if "ending" in name_map:
+        result.ed_start_ms = name_map["ending"]
+        result.ed_source   = MatchSource.AUDIO
+        if "epilogue" in name_map:
+            result.ed_end_ms = name_map["epilogue"]
+
+    return result
+
 # ── public API (same signature app.py / analyzer-callers expect) ──────────────
 
 def analyze_video(
@@ -167,6 +211,15 @@ def analyze_video(
     theme_portion: float  = 0.90,
     downsample: int       = 32,
     work_path: Optional[str] = None,
+    # ── Shared Database ─────────────────────────────────────────────────────
+    db_meta: Optional[dict] = None,
+    # db_meta = {
+    #     "anime_id":      int,    # AniList ID    (required for DB lookup)
+    #     "anime_title":   str,    # Anime title   (stored in DB)
+    #     "season_number": int,    # Season number (required for DB lookup)
+    # }
+    # Passed from app.py after anime selection and ID resolution.
+    # If None, DB integration is skipped entirely.
 ) -> AnalysisResult:
     """
     Analyze a single video file using Auto_Chap v4.2 (core.py).
@@ -179,6 +232,9 @@ def analyze_video(
     log_func     : Optional callback(message, tag) for GUI log panel.
     cancel_event : Optional threading.Event for cancellation support.
     search_name  : Anime name to search on animethemes.moe.
+    db_meta      : Optional dict with anime_id, anime_title, season_number.
+                   When provided, the shared DB is checked before analysis
+                   and updated after.
     """
 
     def log(msg: str, tag: str = "dim"):
@@ -192,6 +248,58 @@ def analyze_video(
     log(f"\n{'─' * 54}\n", "dim")
     log(f"▶ {basename}\n", "ch")
     log(f"  Episode: {episode if episode is not None else '?'}\n", "dim")
+
+    # ── [1] Shared Database — check before analysis ───────────────────────────
+    if db_meta and episode is not None:
+        anime_id      = db_meta.get("anime_id")
+        anime_title   = db_meta.get("anime_title", search_name or "Unknown")
+        season_number = db_meta.get("season_number", 1)
+
+        if anime_id:
+            db = get_shared_db()
+            log(
+                f"  [DB] Checking shared DB "
+                f"(anime_id={anime_id}, S{season_number:02d}E{episode:02d})…\n",
+                "dim",
+            )
+            cached_row = db.lookup(
+                anime_id=anime_id,
+                season_number=season_number,
+                episode_number=episode,
+            )
+            if cached_row:
+                # cached_row["chapters"] is a ready list[Chapter] from the orchestrator
+                cached_chapters = cached_row.get("chapters", [])
+                if cached_chapters:
+                    src_label = cached_row.get("source", "db")
+                    log(
+                        f"  [DB] ✔ Found in shared DB ({src_label})"
+                        f" confidence={cached_row['confidence']}"
+                        f" used={cached_row['use_count']}x\n",
+                        "ok",
+                    )
+                    log("  [DB] Skipping audio analysis — loading from DB\n", "ok")
+
+                    # Build a full AnalysisResult from the cached chapters
+                    xml_path = os.path.splitext(video_path)[0] + "_chapters.xml"
+                    result   = _result_from_cached_chapters(
+                        video_path, cached_chapters, xml_path, video_duration_ms,
+                    )
+
+                    from chapters import write_chapters_xml
+                    write_chapters_xml(result.chapters, xml_path)
+
+                    # Log the chapters
+                    for ch in cached_chapters:
+                        log(f"    {ms_to_display(ch.timestamp_ms)}  →  {ch.name}\n", "ch")
+
+                    return result
+
+            log("  [DB] Not found — proceeding with audio analysis\n", "dim")
+    else:
+        anime_id      = None
+        anime_title   = search_name or "Unknown"
+        season_number = 1
 
     # ── temp output paths ─────────────────────────────────────────────────────
     chapters_txt = os.path.splitext(video_path)[0] + ".autochap_tmp.txt"
@@ -267,4 +375,44 @@ def analyze_video(
     from chapters import write_chapters_xml
     write_chapters_xml(result.chapters, xml_path)
 
+    # ── [2] Shared Database — save after analysis ─────────────────────────────
+    if anime_id and episode is not None and result.chapters:
+        db         = get_shared_db()
+        confidence = compute_confidence(result.op_source, result.ed_source)
+        saved      = db.upsert(
+            anime_id=anime_id,
+            anime_title=anime_title,
+            season_number=season_number,
+            episode_number=episode,
+            chapters=result.chapters,
+            confidence=confidence,
+        )
+        if saved:
+            log(
+                f"  [DB] ✔ Saved to shared DB "
+                f"(confidence={confidence})\n",
+                "ok",
+            )
+        else:
+            # Show the real reason for the failure
+            err_detail = getattr(db, "_last_remote_error", None) or "unknown error"
+            log(f"  [DB] ✘ Could not save to shared DB\n", "err")
+            log(f"  [DB]   Reason: {err_detail}\n", "err")
+
+            # Suggestions based on error type
+            if "not configured" in err_detail.lower():
+                log("  [DB]   → Add SUPABASE_URL and SUPABASE_KEY to supabase_config.py\n", "dim")
+            elif "42P01" in err_detail or "does not exist" in err_detail:
+                log("  [DB]   → Table missing — run supabase_setup.sql in Supabase SQL Editor\n", "dim")
+            elif "42501" in err_detail or "permission" in err_detail.lower():
+                log("  [DB]   → RLS blocking write — check policy allow_public_insert\n", "dim")
+            elif "JWT" in err_detail or "401" in err_detail:
+                log("  [DB]   → anon key is invalid or expired\n", "dim")
+            elif "Network" in err_detail or "timed out" in err_detail:
+                log("  [DB]   → Check your internet connection\n", "dim")
+
+            log("  [DB]   Chapters are saved in the local cache regardless\n", "dim")
+            log("  [DB]   Click 'DB STATS' for full diagnostics\n", "dim")
+
     return result
+

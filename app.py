@@ -22,7 +22,10 @@ from episode import extract_episode_number
 from ffprobe_utils import get_video_duration_ms
 from models import AnalysisResult, MatchSource, Theme
 from timestamps import ms_to_mkv_timestamp
-from dialogs import AnimePickerDialog, ReviewDialog
+from dialogs import AnimePickerDialog, ReviewDialog, SettingsDialog
+from settings import get_chapter_names, load_settings, save_settings
+from api_anilist import resolve_anime_ids
+from shared_db import get_shared_db
 
 try:
     import tkinter as tk
@@ -40,7 +43,7 @@ class Application:
 
     def __init__(self, root: "tk.Tk"):
         self.root = root
-        root.title(f"Anime Chapters Generator  {CURRENT_VERSION}")
+        root.title(f"AniChapters {CURRENT_VERSION}")
         root.geometry("820x720")
         root.configure(bg=BG)
         root.resizable(True, True)
@@ -50,6 +53,8 @@ class Application:
         self.themes: list[Theme] = []
         self.results: list[AnalysisResult] = []
         self.anime_name: str = ""
+        self.db_meta: dict = {}          # {anime_id, anime_title, season_number} — resolved async after theme load
+        self.settings: dict = load_settings()
         self.busy = False
         self.inplace = tk.BooleanVar(value=False)
         self.cancel_event: Optional[threading.Event] = None
@@ -246,6 +251,19 @@ class Application:
         )
         self.btn_mux.pack(side="left", padx=(0, 16))
 
+        tk.Button(
+            row,
+            text="⚙ Settings",
+            font=FONTS,
+            fg=TEXT,
+            bg=BORD,
+            bd=0,
+            padx=10,
+            pady=6,
+            cursor="hand2",
+            command=self._open_settings,
+        ).pack(side="left", padx=(0, 8))
+
         # In-place option
         tk.Checkbutton(
             row,
@@ -318,6 +336,18 @@ class Application:
             cursor="hand2",
             padx=6,
             command=self._clear_cache,
+        ).pack(side="right", padx=(0, 6))
+
+        tk.Button(
+            header,
+            text="DB STATS",
+            font=FONTS,
+            fg=A4,
+            bg=PANEL,
+            bd=0,
+            cursor="hand2",
+            padx=6,
+            command=self._show_db_stats,
         ).pack(side="right", padx=(0, 6))
 
         # Log text
@@ -602,9 +632,44 @@ class Application:
         """Handle themes loaded successfully"""
         self.themes     = themes
         self.anime_name = anime_name          # passed to core.py as search_name
+        self.db_meta    = {}                  # reset — resolved async below
         self.theme_label.config(text=f"✔ {anime_name}", fg=A2)
         self._log(f"\nReady — click 'Analyze All'\n\n", "ok")
         self._set_busy(False)
+
+        # ── AniList ID resolution (background, non-blocking) ──────────────────
+        # Runs in a separate thread to avoid blocking the UI
+        threading.Thread(
+            target=self._resolve_anilist_ids,
+            args=(anime_name,),
+            daemon=True,
+        ).start()
+
+    def _resolve_anilist_ids(self, anime_name: str) -> None:
+        """
+        Fetch anime_id and season_number from AniList and store them in self.db_meta.
+        Runs in the background — silent failure does not stop any feature.
+        """
+        try:
+            ids = resolve_anime_ids(anime_name)
+            if ids:
+                self.db_meta = ids
+                self.root.after(
+                    0,
+                    self._log,
+                    f"  [DB] AniList ID={ids['anime_id']} "
+                    f"S{ids['season_number']:02d} resolved\n",
+                    "dim",
+                )
+            else:
+                self.root.after(
+                    0,
+                    self._log,
+                    "  [DB] AniList ID not resolved — DB lookup disabled\n",
+                    "dim",
+                )
+        except Exception:
+            pass  # silent — AniList is optional
 
     # ─── Cancellation ─────────────────────────────────────────────────────────
 
@@ -642,27 +707,30 @@ class Application:
                         log_func=self._log_async,
                         cancel_event=self.cancel_event,
                         search_name=self.anime_name,
+                        db_meta=self.db_meta if self.db_meta else None,
                     )
 
                     if self.cancel_event.is_set():
                         break
 
                     # Build chapters
+                    ch_names = get_chapter_names(self.settings)
                     op_label = (
                         f"♪ {result.op_theme.label} — {result.op_theme.title}"
                         if result.op_theme
-                        else "♪ Opening"
+                        else ch_names["opening"]
                     )
                     ed_label = (
                         f"♪ {result.ed_theme.label} — {result.ed_theme.title}"
                         if result.ed_theme
-                        else "♪ Ending"
+                        else ch_names["ending"]
                     )
 
                     chapters = build_chapters(
                         result.op_start_ms, result.op_end_ms, op_label, result.op_source,
                         result.ed_start_ms, result.ed_end_ms, ed_label, result.ed_source,
                         result.video_duration_ms,
+                        ch_names=ch_names,
                     )
 
                     # Write XML
@@ -729,6 +797,15 @@ class Application:
         self.cancel_event = None
 
     # ─── Review dialog ────────────────────────────────────────────────────────
+
+
+    def _open_settings(self):
+        """Open chapter name settings dialog"""
+        dialog = SettingsDialog(self.root, self.settings)
+        if dialog.saved:
+            from settings import load_settings
+            self.settings = load_settings()
+            self._log("Settings saved.\n", "ok")
 
     def _review_chapters(self):
         """Open review dialog"""
@@ -865,54 +942,91 @@ class Application:
     # ─── Cache / log utilities ────────────────────────────────────────────────
 
     def _clear_cache(self):
-        """Clean up temporary directories and downloaded themes"""
+        """
+        Ask user for a root folder, then recursively delete all
+        .themes directories and _chapters.xml files inside it.
+        """
         import glob
         import tempfile
 
-        deleted = 0
-        freed   = 0
+        # Ask user to pick the root folder
+        root_folder = filedialog.askdirectory(
+            title="Select root folder to clean (e.g. C:\\Users\\503\\Videos\\Fun\\Anime)"
+        )
+        if not root_folder:
+            self._log("Clear cache cancelled.\n", "dim")
+            return
+
+        deleted_files = 0
+        deleted_dirs  = 0
+        freed         = 0
+
+        def _file_size(path):
+            try:
+                return os.path.getsize(path)
+            except Exception:
+                return 0
 
         def _del_dir(dir_path):
-            nonlocal deleted, freed
+            nonlocal deleted_dirs, freed
             if os.path.isdir(dir_path):
                 try:
                     size = sum(
-                        os.path.getsize(os.path.join(dp, f))
+                        _file_size(os.path.join(dp, f))
                         for dp, _, files in os.walk(dir_path)
                         for f in files
                     )
                     shutil.rmtree(dir_path, ignore_errors=True)
-                    freed   += size
-                    deleted += 1
+                    freed        += size
+                    deleted_dirs += 1
+                    self._log(f"  Deleted {dir_path}\n", "dim")
                 except Exception:
                     pass
 
-        # Clean tracked temp dirs
+        def _del_file(file_path):
+            nonlocal deleted_files, freed
+            if os.path.isfile(file_path):
+                try:
+                    freed         += _file_size(file_path)
+                    os.remove(file_path)
+                    deleted_files += 1
+                    self._log(f"  Deleted {os.path.basename(file_path)}\n", "dim")
+                except Exception:
+                    pass
+
+        self._log(f"\nScanning: {root_folder}\n", "ch")
+
+        # Walk recursively through the chosen folder
+        for dirpath, dirnames, filenames in os.walk(root_folder, topdown=True):
+            # Delete .themes folders
+            if ".themes" in dirnames:
+                _del_dir(os.path.join(dirpath, ".themes"))
+                dirnames.remove(".themes")  # don't recurse into it
+
+            # Delete _chapters.xml files
+            for fname in filenames:
+                if fname.endswith("_chapters.xml"):
+                    _del_file(os.path.join(dirpath, fname))
+
+        # Also clean tracked temp dirs and system temp
         for dir_path in list(_TEMP_DIRS):
             _del_dir(dir_path)
             if dir_path in _TEMP_DIRS:
                 _TEMP_DIRS.remove(dir_path)
 
-        # Clean any remaining animechap_* dirs in system temp
         tmp_dir = tempfile.gettempdir()
         for dir_path in glob.glob(os.path.join(tmp_dir, "animechap_*")):
             _del_dir(dir_path)
 
-        # Clean the hidden themes cache (~/.animechap_themes or %APPDATA%\.animechap_themes)
-        if os.name == "nt":
-            _base = os.environ.get("APPDATA", os.path.expanduser("~"))
-        else:
-            _base = os.path.expanduser("~")
-        themes_cache = os.path.join(_base, ".animechap_themes")
-        if os.path.isdir(themes_cache):
-            _del_dir(themes_cache)
-            self._log(f"Deleted themes cache: {themes_cache}\n", "dim")
-
         mb = freed / (1024 * 1024)
-        if deleted:
-            self._log(f"Deleted {deleted} dir(s) ({mb:.1f} MB freed)\n", "ok")
+        total = deleted_dirs + deleted_files
+        if total:
+            self._log(
+                f"\nCleared {deleted_dirs} .themes folder(s) + {deleted_files} XML file(s) "
+                f"({mb:.1f} MB freed)\n", "ok"
+            )
         else:
-            self._log("No cache to clean.\n", "dim")
+            self._log("Nothing to clean in that folder.\n", "dim")
 
     def _copy_log(self):
         """Copy log content to clipboard"""
@@ -925,6 +1039,41 @@ class Application:
         self.root.clipboard_append(content)
         self.root.update()
         self._log("Log copied to clipboard.\n", "ok")
+
+    # ─── Shared DB stats ─────────────────────────────────────────────────────
+
+    def _show_db_stats(self) -> None:
+        """Display full stats and diagnostics for the shared database."""
+        import threading
+        import remote_db as _rdb
+
+        self._log("\n── Shared Database ─────────────────────────\n", "dim")
+
+        # Local cache stats (instant)
+        try:
+            db    = get_shared_db()
+            stats = db.get_stats()
+            self._log(f"  💾 Local cache: {stats['cache_episodes']} episode(s)\n", "ok")
+            self._log(f"  💾 Cache path : {db.cache_path()}\n", "dim")
+        except Exception as exc:
+            self._log(f"  💾 Cache error: {exc}\n", "err")
+
+        # Supabase diagnostics in background (requires network)
+        self._log("  ☁  Checking Supabase…\n", "dim")
+
+        def run_diagnose():
+            try:
+                msgs = _rdb.diagnose()
+                def show():
+                    for m in msgs:
+                        tag = "ok" if m.startswith("✔") else ("err" if m.startswith("✘") else "dim")
+                        self._log(f"  ☁  {m}\n", tag)
+                    self._log("────────────────────────────────────────────\n", "dim")
+                self.root.after(0, show)
+            except Exception as exc:
+                self.root.after(0, self._log, f"  ☁  diagnose error: {exc}\n", "err")
+
+        threading.Thread(target=run_diagnose, daemon=True).start()
 
     # ─── Error handler ────────────────────────────────────────────────────────
 

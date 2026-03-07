@@ -1,0 +1,285 @@
+"""
+shared_db.py — Shared Chapters Database Orchestrator  (v2 — Remote + Local Cache)
+
+تدفق العمل:
+  lookup(anime_id, season, episode)
+    ├── [1] تحقق من الـ cache المحلي (SQLite) — فوري
+    ├── [2] إذا لم يوجد → اتصل بـ Supabase (remote)
+    ├── [3] إذا وُجد remotely → احفظه في الـ cache المحلي → أعِده
+    └── [4] إذا لم يوجد في أي مكان → أعِد None (سيتم التحليل)
+
+  upsert(...)
+    ├── [1] ارفع إلى Supabase (remote) — أولاً وأهم
+    └── [2] احفظ في الـ cache المحلي — للاستخدام السريع لاحقاً
+"""
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import threading
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from models import Chapter, MatchSource
+import remote_db
+
+_CACHE_TTL_DAYS = 30
+_CACHE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "shared_chapters_cache.db",
+)
+
+_CREATE_CACHE_SQL = """
+CREATE TABLE IF NOT EXISTS chapters_cache (
+    anime_id        INTEGER NOT NULL,
+    season_number   INTEGER NOT NULL DEFAULT 1,
+    episode_number  INTEGER NOT NULL,
+    anime_title     TEXT    NOT NULL DEFAULT '',
+    chapters_json   TEXT    NOT NULL,
+    confidence      TEXT    NOT NULL DEFAULT 'medium',
+    use_count       INTEGER NOT NULL DEFAULT 0,
+    cached_at       TEXT    NOT NULL,
+    PRIMARY KEY (anime_id, season_number, episode_number)
+);
+CREATE INDEX IF NOT EXISTS idx_cache_lookup
+    ON chapters_cache (anime_id, season_number, episode_number);
+"""
+
+
+class SharedDatabase:
+    """
+    Orchestrator يجمع بين:
+      - remote_db  (Supabase) : المصدر الحقيقي المشترك بين جميع المستخدمين
+      - SQLite cache           : تسريع محلي، TTL = 30 يوم
+    جميع العمليات thread-safe. الفشل الصامت مضمون.
+    """
+
+    def __init__(self, cache_path: str = _CACHE_PATH):
+        self._lock              = threading.Lock()
+        self._cache_path        = cache_path
+        self._last_remote_error: Optional[str] = None
+        self._init_cache()
+
+    def _init_cache(self) -> None:
+        with self._connect_cache() as conn:
+            conn.executescript(_CREATE_CACHE_SQL)
+
+    def _connect_cache(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._cache_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+    @staticmethod
+    def serialize_chapters(chapters: list) -> str:
+        return json.dumps(
+            [{"timestamp_ms": c.timestamp_ms, "name": c.name, "source": c.source.value}
+             for c in chapters],
+            ensure_ascii=False,
+        )
+
+    @staticmethod
+    def deserialize_chapters(chapters_json) -> list:
+        try:
+            raw = json.loads(chapters_json) if isinstance(chapters_json, str) else chapters_json
+            result = []
+            for item in raw:
+                try:
+                    source = MatchSource(item.get("source", "none"))
+                except ValueError:
+                    source = MatchSource.NONE
+                result.append(Chapter(
+                    timestamp_ms=int(item["timestamp_ms"]),
+                    name=str(item["name"]),
+                    source=source,
+                ))
+            return result
+        except Exception:
+            return []
+
+    def _cache_get(self, anime_id, season_number, episode_number) -> Optional[dict]:
+        try:
+            with self._connect_cache() as conn:
+                row = conn.execute(
+                    "SELECT * FROM chapters_cache "
+                    "WHERE anime_id=? AND season_number=? AND episode_number=? LIMIT 1",
+                    (anime_id, season_number, episode_number),
+                ).fetchone()
+                if not row:
+                    return None
+                cached_at = datetime.fromisoformat(row["cached_at"])
+                if datetime.now(timezone.utc) - cached_at > timedelta(days=_CACHE_TTL_DAYS):
+                    conn.execute(
+                        "DELETE FROM chapters_cache "
+                        "WHERE anime_id=? AND season_number=? AND episode_number=?",
+                        (anime_id, season_number, episode_number),
+                    )
+                    return None
+                return dict(row)
+        except Exception:
+            return None
+
+    def _cache_set(self, anime_id, season_number, episode_number,
+                   anime_title, chapters_json, confidence, use_count=0) -> None:
+        try:
+            with self._connect_cache() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO chapters_cache
+                        (anime_id, season_number, episode_number, anime_title,
+                         chapters_json, confidence, use_count, cached_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (anime_id, season_number, episode_number) DO UPDATE SET
+                        anime_title   = excluded.anime_title,
+                        chapters_json = excluded.chapters_json,
+                        confidence    = excluded.confidence,
+                        use_count     = excluded.use_count,
+                        cached_at     = excluded.cached_at
+                    """,
+                    (anime_id, season_number, episode_number, anime_title,
+                     chapters_json, confidence, use_count, _utcnow()),
+                )
+        except Exception:
+            pass
+
+    def lookup(self, anime_id: int, season_number: int, episode_number: int) -> Optional[dict]:
+        """
+        ابحث عن شابترات حلقة.
+        يُعيد dict: {"chapters": list[Chapter], "confidence", "use_count",
+                      "anime_title", "source": "cache"|"remote"}
+        أو None إذا لم تُوجد في أي مكان.
+        """
+        with self._lock:
+            # [1] Cache محلي
+            cached = self._cache_get(anime_id, season_number, episode_number)
+            if cached:
+                chapters = self.deserialize_chapters(cached["chapters_json"])
+                if chapters:
+                    return {
+                        "chapters":    chapters,
+                        "confidence":  cached["confidence"],
+                        "use_count":   cached["use_count"],
+                        "anime_title": cached["anime_title"],
+                        "source":      "cache",
+                    }
+
+            # [2] Remote (Supabase)
+            if not remote_db.is_configured():
+                return None
+
+            remote_row = remote_db.lookup(anime_id, season_number, episode_number)
+            if not remote_row:
+                return None
+
+            # [3] احفظ في الـ cache المحلي
+            chapters_raw = remote_row.get("chapters_json", [])
+            chapters_str = (
+                json.dumps(chapters_raw, ensure_ascii=False)
+                if isinstance(chapters_raw, list)
+                else str(chapters_raw)
+            )
+            self._cache_set(
+                anime_id=anime_id, season_number=season_number,
+                episode_number=episode_number,
+                anime_title=remote_row.get("anime_title", ""),
+                chapters_json=chapters_str,
+                confidence=remote_row.get("confidence", "medium"),
+                use_count=remote_row.get("use_count", 0),
+            )
+
+            chapters = remote_db.deserialize_chapters(chapters_raw)
+            if not chapters:
+                return None
+
+            return {
+                "chapters":    chapters,
+                "confidence":  remote_row.get("confidence", "medium"),
+                "use_count":   remote_row.get("use_count", 0),
+                "anime_title": remote_row.get("anime_title", ""),
+                "source":      "remote",
+            }
+
+    def upsert(self, anime_id: int, anime_title: str, season_number: int,
+               episode_number: int, chapters: list, confidence: str = "medium") -> bool:
+        """
+        ارفع إلى Supabase المركزي + احفظ في الـ cache المحلي.
+        يُعيد True إذا نجح الرفع إلى Remote.
+        """
+        if not chapters:
+            return False
+
+        chapters_json = self.serialize_chapters(chapters)
+        remote_ok     = False
+
+        with self._lock:
+            # [1] Remote أولاً — remote_db.upsert() يُعيد (bool, error_str)
+            if remote_db.is_configured():
+                remote_ok, remote_err = remote_db.upsert(
+                    anime_id=anime_id, anime_title=anime_title,
+                    season_number=season_number, episode_number=episode_number,
+                    chapters=chapters, confidence=confidence,
+                )
+                self._last_remote_error = remote_err  # للاستخدام في analyzer.py
+            else:
+                self._last_remote_error = "Supabase not configured"
+
+            # [2] Cache دائماً بغض النظر عن نتيجة Remote
+            self._cache_set(
+                anime_id=anime_id, season_number=season_number,
+                episode_number=episode_number, anime_title=anime_title,
+                chapters_json=chapters_json, confidence=confidence,
+            )
+
+        return remote_ok
+
+    def get_stats(self) -> dict:
+        stats = {
+            "remote_configured": remote_db.is_configured(),
+            "cache_episodes":    0,
+            "remote_episodes":   None,
+            "remote_total_hits": None,
+        }
+        try:
+            with self._connect_cache() as conn:
+                row = conn.execute("SELECT COUNT(*) AS total FROM chapters_cache").fetchone()
+                stats["cache_episodes"] = row["total"] if row else 0
+        except Exception:
+            pass
+        if remote_db.is_configured():
+            rs = remote_db.get_stats()
+            if rs:
+                stats["remote_episodes"]   = rs.get("total_episodes")
+                stats["remote_total_hits"] = rs.get("total_hits")
+        return stats
+
+    def cache_path(self) -> str:
+        return self._cache_path
+
+
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+_instance = None
+_inst_lock = threading.Lock()
+
+
+def get_shared_db() -> SharedDatabase:
+    global _instance
+    if _instance is None:
+        with _inst_lock:
+            if _instance is None:
+                _instance = SharedDatabase()
+    return _instance
+
+
+def compute_confidence(op_source: MatchSource, ed_source: MatchSource) -> str:
+    audio = MatchSource.AUDIO
+    if op_source == audio and ed_source == audio:
+        return "high"
+    if op_source == audio or ed_source == audio:
+        return "medium"
+    if op_source == MatchSource.FALLBACK or ed_source == MatchSource.FALLBACK:
+        return "low"
+    return "fallback"

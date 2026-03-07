@@ -1,0 +1,5 @@
+supabase_config.py 
+shared_chapters_cache.db 
+*.db 
+__pycache__/ 
+*.pyc 
