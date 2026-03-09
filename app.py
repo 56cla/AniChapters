@@ -38,7 +38,7 @@ try:
 except ImportError:
     GUI_AVAILABLE = False
 
-CURRENT_VERSION = "2.0"
+CURRENT_VERSION = "4.0"
 GITHUB_REPO     = "56cla/AniChapters"
 
 
