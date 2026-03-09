@@ -1,76 +1,95 @@
 """
-Audio matching engine: download helper, PCM extraction, NCC-FFT, multi-phase search.
+Audio matching engine — powered by librosa + scipy (ported from Auto Chap v4.2).
+
+Replaces the previous NCC-FFT/ffmpeg approach with the proven correlation
+method used by Auto_Chap (SubsPlus+), while keeping the same public interface
+that analyzer.py expects:
+
+    find_theme_start(video_path, theme_url, theme_duration_ms,
+                     search_start_seconds, search_end_seconds,
+                     log_func, cancel_event) -> Optional[int]  (ms)
 """
 from __future__ import annotations
 
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import urllib.request
 from typing import Callable, Optional
 
-from constants import (
-    API_HEADERS,
-    NEEDLE_DURATION_SECONDS,
-    NEEDLE_SKIP_SECONDS,
-    NCC_THRESHOLD,
-    _THEME_FILE_CACHE,
-)
+from constants import API_HEADERS, _THEME_FILE_CACHE
 from timestamps import ms_to_display
 
+# Suppress console window on Windows (both native and PyInstaller .exe)
+_CREATIONFLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+# ── optional heavy imports (checked at call-time) ────────────────────────────
+try:
+    import numpy as np
+    _NUMPY_OK = True
+except ImportError:
+    _NUMPY_OK = False
+
+try:
+    import librosa
+    import audioread.ffdec
+    from scipy import signal as _signal
+    _LIBROSA_OK = True
+except ImportError:
+    _LIBROSA_OK = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Download helper (unchanged from original — kept for theme URL support)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _download_to_temp(url: str, log_func: Optional[Callable] = None) -> Optional[str]:
-    """
-    Download a remote URL to a local temp file.
-    Returns the local file path, or None on failure.
-    Uses caching to avoid re-downloading the same URL.
-    """
+    """Download a remote URL to a local temp file with caching + retries."""
     import time
 
-    # Check cache first
     if url in _THEME_FILE_CACHE:
         cached = _THEME_FILE_CACHE[url]
-        if os.path.exists(cached) and os.path.getsize(cached) > 10000:
+        if os.path.exists(cached) and os.path.getsize(cached) > 10_000:
             return cached
-        else:
-            del _THEME_FILE_CACHE[url]
+        del _THEME_FILE_CACHE[url]
 
-    # Try downloading with retries
     max_retries = 3
     temp_path   = ""
+
     for attempt in range(max_retries):
         try:
             fd, temp_path = tempfile.mkstemp(suffix=".webm")
             os.close(fd)
 
             request = urllib.request.Request(url, headers=API_HEADERS)
-            with urllib.request.urlopen(request, timeout=90) as response:
+            with urllib.request.urlopen(request, timeout=90) as resp:
                 with open(temp_path, "wb") as f:
                     while True:
-                        chunk = response.read(65536)
+                        chunk = resp.read(65_536)
                         if not chunk:
                             break
                         f.write(chunk)
 
-            # Verify download
-            if os.path.getsize(temp_path) < 10000:
+            if os.path.getsize(temp_path) < 10_000:
                 os.remove(temp_path)
                 if attempt < max_retries - 1:
                     if log_func:
-                        log_func(f"  Download incomplete, retrying...\n", "dim")
+                        log_func("  Download incomplete, retrying…\n", "dim")
                     time.sleep(2 ** attempt)
                     continue
                 return None
 
-            file_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+            mb = os.path.getsize(temp_path) / (1024 * 1024)
             if log_func:
-                log_func(f"  Downloaded: {file_size_mb:.1f} MB → {os.path.basename(temp_path)}\n", "dim")
+                log_func(f"  Downloaded: {mb:.1f} MB\n", "dim")
+
             _THEME_FILE_CACHE[url] = temp_path
             return temp_path
 
-        except Exception as e:
+        except Exception as exc:
             if temp_path and os.path.exists(temp_path):
                 try:
                     os.remove(temp_path)
@@ -78,173 +97,128 @@ def _download_to_temp(url: str, log_func: Optional[Callable] = None) -> Optional
                     pass
             if attempt < max_retries - 1:
                 if log_func:
-                    log_func(f"  Download error, retrying...\n", "dim")
+                    log_func("  Download error, retrying…\n", "dim")
                 time.sleep(2 ** attempt)
                 continue
             if log_func:
-                log_func(f"  Download failed: {e}\n", "err")
+                log_func(f"  Download failed: {exc}\n", "err")
             return None
 
     return None
 
 
-def extract_audio_pcm(
-    source: str,
-    start_seconds: float = 0,
-    duration_seconds: float = 0,
-    sample_rate: int = 8000,
+# ─────────────────────────────────────────────────────────────────────────────
+#  Core matching  (Auto Chap v4.2 algorithm)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_audio_librosa(
+    path: str,
+    sr: Optional[int] = None,
     log_func: Optional[Callable] = None,
-) -> "Optional[numpy.ndarray]":
-    """
-    Extract audio as PCM data using ffmpeg.
-
-    Args:
-        source: Video or audio file path/URL
-        start_seconds: Start position in seconds
-        duration_seconds: Duration to extract (0 = all)
-        sample_rate: Target sample rate
-        log_func: Logging function
-
-    Returns:
-        Normalized numpy float32 mono PCM array, or None on failure
-    """
+) -> "tuple[Optional[np.ndarray], int]":
+    """Load audio using librosa (via audioread/ffdec for non-wav files)."""
     try:
-        import numpy as np
-    except ImportError:
+        if path.endswith((".webm", ".ogg", ".mp4", ".mkv")):
+            aro = audioread.ffdec.FFmpegAudioFile(path)
+            y, file_sr = librosa.load(aro, sr=sr)
+        else:
+            y, file_sr = librosa.load(path, sr=sr)
+        return y, file_sr
+    except Exception as exc:
         if log_func:
-            log_func("  numpy not installed — pip install numpy\n", "err")
-        return None
+            log_func(f"  librosa load error: {exc}\n", "err")
+        return None, 0
 
+
+def _extract_segment_ffmpeg(
+    source: str,
+    start_s: float,
+    duration_s: float,
+    sr: int,
+    log_func: Optional[Callable] = None,
+) -> "Optional[np.ndarray]":
+    """
+    Use ffmpeg to extract a segment as raw PCM then load into numpy.
+    Faster than loading the entire file with librosa when we only need a window.
+    """
     if not shutil.which("ffmpeg"):
         if log_func:
             log_func("  ffmpeg not found in PATH\n", "err")
         return None
 
-    # If source is a remote URL, download to temp file first for reliability
-    actual_source = source
-    if source.startswith("http://") or source.startswith("https://"):
-        local_file = _download_to_temp(source, log_func)
-        if local_file is None:
-            return None
-        actual_source = local_file
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
 
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-loglevel", "error",
-    ]
+    if start_s > 0.001:
+        cmd += ["-ss", f"{start_s:.3f}"]
 
-    if start_seconds > 0.001:
-        cmd.extend(["-ss", f"{start_seconds:.3f}"])
+    cmd += ["-i", source]
 
-    cmd.extend(["-i", actual_source])
+    if duration_s > 0.001:
+        cmd += ["-t", f"{duration_s:.3f}"]
 
-    if duration_seconds > 0.001:
-        cmd.extend(["-t", f"{duration_seconds:.3f}"])
-
-    cmd.extend([
-        "-vn",
-        "-ar", str(sample_rate),
-        "-ac", "1",
-        "-f", "s16le",
-        "pipe:1",
-    ])
+    cmd += ["-vn", "-ar", str(sr), "-ac", "1", "-f", "s16le", "pipe:1"]
 
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            timeout=300,
-        )
-
+        result = subprocess.run(cmd, capture_output=True, timeout=300,
+                                creationflags=_CREATIONFLAGS)
         if result.returncode != 0 or len(result.stdout) < 512:
             if log_func and result.stderr:
-                error_msg = result.stderr.decode(errors="replace").strip()[-200:]
-                log_func(f"  ffmpeg error: {error_msg}\n", "err")
+                msg = result.stderr.decode(errors="replace").strip()[-200:]
+                log_func(f"  ffmpeg error: {msg}\n", "err")
             return None
 
-        # Convert to float32
         audio = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32)
-
-        if log_func:
-            duration_extracted = len(audio) / sample_rate
-            log_func(f"  PCM: {len(result.stdout)//1024}KB → {duration_extracted:.1f}s audio at {sample_rate}Hz\n", "dim")
-
-        # Normalize by RMS for volume invariance
-        rms = np.sqrt(np.mean(audio ** 2))
-        if rms > 1.0:
-            audio = audio / rms
-
         return audio
 
     except subprocess.TimeoutExpired:
         if log_func:
             log_func("  ffmpeg timeout\n", "err")
         return None
-    except Exception as e:
+    except Exception as exc:
         if log_func:
-            log_func(f"  ffmpeg exception: {e}\n", "err")
+            log_func(f"  ffmpeg exception: {exc}\n", "err")
         return None
 
 
-def compute_ncc_fft(needle: "numpy.ndarray", haystack: "numpy.ndarray") -> "numpy.ndarray":
+def _correlate_and_find(
+    y_episode: "np.ndarray",
+    y_theme_portion: "np.ndarray",
+    sr: int,
+    downsample: int,
+    score_threshold: float,
+    silence_prefix_s: float = 5.0,
+) -> "tuple[Optional[float], float]":
     """
-    Compute Normalized Cross-Correlation using FFT.
+    Run scipy signal.correlate (same as Auto Chap v4.2 find_offset).
 
-    Returns array of correlation scores (values between -1 and 1).
-    Length = len(haystack) - len(needle) + 1
-
-    Uses proper local mean normalization for each window.
+    Returns (offset_seconds, score).  offset_seconds is None if below threshold.
     """
-    import numpy as np
+    y_ep  = y_episode[::downsample]
+    y_th  = y_theme_portion[::downsample]
 
-    needle_len   = len(needle)
-    haystack_len = len(haystack)
+    # 5s silence prefix to handle matches right at the start
+    sil_len = int(silence_prefix_s * sr / downsample)
+    y_ep_padded = np.empty(sil_len + len(y_ep), dtype=y_ep.dtype)
+    y_ep_padded[:sil_len] = 0
+    y_ep_padded[sil_len:] = y_ep
 
-    if haystack_len < needle_len:
-        return np.array([0.0])
+    try:
+        c = _signal.correlate(y_ep_padded, y_th, mode="valid", method="auto")
+    except Exception:
+        return None, 0.0
 
-    # Normalize needle (zero mean, unit norm)
-    needle_centered = needle - needle.mean()
-    needle_norm     = np.linalg.norm(needle_centered)
+    match_idx = int(np.argmax(c))
+    score     = float(np.max(c))
+    offset_s  = max((match_idx - sil_len) / (sr / downsample), 0.0)
 
-    if needle_norm < 1e-7:
-        return np.zeros(haystack_len - needle_len + 1)
+    if score >= score_threshold:
+        return offset_s, score
+    return None, score
 
-    needle_normalized = needle_centered / needle_norm
 
-    # Compute FFT size (next power of 2)
-    fft_size = 1
-    while fft_size < (haystack_len + needle_len):
-        fft_size <<= 1
-
-    # ─── FFT cross-correlation ────────────────────────────────────────────────
-    H           = np.fft.rfft(haystack, n=fft_size)
-    N           = np.fft.rfft(needle_normalized[::-1], n=fft_size)
-    correlation = np.fft.irfft(H * N, n=fft_size)[needle_len - 1:haystack_len]
-
-    # ─── Local means via cumsum ───────────────────────────────────────────────
-    cumsum      = np.concatenate(([0.0], np.cumsum(haystack)))
-    local_sums  = cumsum[needle_len:haystack_len + 1] - cumsum[:haystack_len - needle_len + 1]
-    local_means = local_sums / needle_len
-
-    # ─── Local variances via cumsum ───────────────────────────────────────────
-    cumsum_sq      = np.concatenate(([0.0], np.cumsum(haystack ** 2)))
-    local_sums_sq  = cumsum_sq[needle_len:haystack_len + 1] - cumsum_sq[:haystack_len - needle_len + 1]
-    local_means_sq = local_sums_sq / needle_len
-    local_vars     = local_means_sq - local_means ** 2
-    local_stds     = np.sqrt(np.maximum(local_vars, 0.0))
-    local_stds[local_stds < 1e-7] = 1e-7  # Prevent division by zero
-
-    # ─── NCC with local mean correction ──────────────────────────────────────
-    ncc = correlation / (local_stds * np.sqrt(needle_len))
-
-    # Clamp to valid range [-1, 1] (numerical errors can exceed this)
-    ncc = np.clip(ncc, -1.0, 1.0)
-
-    return ncc
-
+# ─────────────────────────────────────────────────────────────────────────────
+#  Public interface  (same signature as the old audio_matcher.py)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def find_theme_start(
     video_path: str,
@@ -254,209 +228,126 @@ def find_theme_start(
     search_end_seconds: float,
     log_func: Optional[Callable] = None,
     cancel_event: Optional[threading.Event] = None,
+    *,
+    # Tuning knobs (same semantics as Auto Chap CLI args)
+    downsample: int   = 32,
+    score: float      = 2_000.0,
+    theme_portion: float = 0.90,
 ) -> Optional[int]:
     """
-    Find the start time of a theme song in a video using multi-phase audio matching.
-
-    Uses three phases:
-      1. COARSE (4kHz, 3s step) - Find approximate location
-      2. MEDIUM (8kHz, 0.5s step) - Narrow down
-      3. FINE (16kHz, 40ms step) - Precise timing
+    Find the start time of a theme in a video using the Auto Chap v4.2
+    correlation algorithm (librosa + scipy).
 
     Returns start time in milliseconds, or None if not found.
     """
-    try:
-        import numpy as np
-    except ImportError:
+    def log(msg: str, tag: str = "dim"):
         if log_func:
-            log_func("  numpy not installed — pip install numpy\n", "err")
+            log_func(msg, tag)
+
+    # ── dependency check ──────────────────────────────────────────────────────
+    if not _NUMPY_OK:
+        log("  numpy not installed — pip install numpy\n", "err")
+        return None
+    if not _LIBROSA_OK:
+        log("  librosa/scipy not installed — pip install librosa scipy audioread\n", "err")
         return None
 
     if cancel_event and cancel_event.is_set():
         return None
 
-    scan_duration = max(1.0, search_end_seconds - search_start_seconds)
+    theme_duration_s = theme_duration_ms / 1000.0
+    scan_duration_s  = max(1.0, search_end_seconds - search_start_seconds)
 
-    # ═══════════════════════════════════════════
-    #  PHASE 1 — COARSE (SR=4000)
-    # ═══════════════════════════════════════════
-    sr1 = 4000
+    # ── download theme if remote ──────────────────────────────────────────────
+    if theme_url.startswith("http://") or theme_url.startswith("https://"):
+        log("  Downloading theme…\n", "dim")
+        local_theme = _download_to_temp(theme_url, log_func)
+        if local_theme is None:
+            log("  Failed to download theme\n", "err")
+            return None
+    else:
+        local_theme = theme_url
 
-    if log_func:
-        log_func(
-            f"  [1/3] Loading (4kHz) theme={NEEDLE_DURATION_SECONDS:.0f}s "
-            f"video={search_start_seconds:.0f}s→{search_end_seconds:.0f}s...\n",
-            "dim",
+    if cancel_event and cancel_event.is_set():
+        return None
+
+    # ── load episode audio (window only, via ffmpeg for speed) ───────────────
+    log(
+        f"  Loading episode audio {search_start_seconds:.0f}s"
+        f"→{search_end_seconds:.0f}s @ native SR…\n",
+        "dim",
+    )
+
+    # Use a moderate sample rate (22050 Hz like librosa default) for accuracy
+    TARGET_SR = 22_050
+
+    y_episode = _extract_segment_ffmpeg(
+        video_path,
+        start_s=search_start_seconds,
+        duration_s=scan_duration_s,
+        sr=TARGET_SR,
+        log_func=log_func,
+    )
+
+    if y_episode is None or len(y_episode) < TARGET_SR:
+        log("  Could not extract episode audio\n", "err")
+        return None
+
+    if cancel_event and cancel_event.is_set():
+        return None
+
+    # ── load theme audio ──────────────────────────────────────────────────────
+    log("  Loading theme audio…\n", "dim")
+
+    y_theme, sr_theme = _load_audio_librosa(local_theme, sr=TARGET_SR, log_func=log_func)
+
+    if y_theme is None or len(y_theme) < TARGET_SR:
+        log("  Could not load theme audio\n", "err")
+        return None
+
+    # Use first `theme_portion` of theme as the needle (same as Auto Chap)
+    portion_samples = int(TARGET_SR * theme_duration_s * theme_portion)
+    y_theme_portion = y_theme[:portion_samples]
+
+    if len(y_theme_portion) < TARGET_SR:
+        log("  Theme portion too short\n", "err")
+        return None
+
+    if cancel_event and cancel_event.is_set():
+        return None
+
+    # ── correlation ───────────────────────────────────────────────────────────
+    log(
+        f"  Correlating (downsample={downsample}, "
+        f"theme_portion={theme_portion:.0%})…\n",
+        "dim",
+    )
+
+    required_score = score / downsample
+
+    offset_s, raw_score = _correlate_and_find(
+        y_episode,
+        y_theme_portion,
+        sr=TARGET_SR,
+        downsample=downsample,
+        score_threshold=required_score,
+    )
+
+    if offset_s is not None:
+        # offset_s is relative to search_start_seconds
+        true_start_s = search_start_seconds + offset_s
+        start_ms     = int(round(true_start_s * 1000))
+        end_ms       = start_ms + theme_duration_ms
+
+        log(
+            f"  ✔ Match  {ms_to_display(start_ms)} → {ms_to_display(end_ms)}"
+            f"  (score={raw_score:.0f})\n",
+            "ok",
         )
-
-    needle1 = extract_audio_pcm(
-        theme_url,
-        start_seconds=NEEDLE_SKIP_SECONDS,
-        duration_seconds=NEEDLE_DURATION_SECONDS,
-        sample_rate=sr1,
-        log_func=log_func,
-    )
-
-    haystack1 = extract_audio_pcm(
-        video_path,
-        start_seconds=search_start_seconds,
-        duration_seconds=scan_duration,
-        sample_rate=sr1,
-        log_func=log_func,
-    )
-
-    if needle1 is None or haystack1 is None:
-        if log_func:
-            log_func("  Failed to load audio\n", "err")
-        return None
-
-    if cancel_event and cancel_event.is_set():
-        return None
-
-    needle1 = needle1[:int(NEEDLE_DURATION_SECONDS * sr1)]
-
-    scores1    = compute_ncc_fft(needle1, haystack1)
-    best_idx1  = int(np.argmax(scores1))
-    best_score1 = float(scores1[best_idx1])
-    best_time1  = search_start_seconds + best_idx1 / sr1
-
-    if log_func:
-        log_func(f"  [1/3] Best t={best_time1:.1f}s score={best_score1:.4f}\n", "dim")
-
-    if best_score1 < NCC_THRESHOLD * 0.5:
-        if log_func:
-            log_func(
-                f"  ✗ No match found in coarse scan (score={best_score1:.4f} < {NCC_THRESHOLD * 0.5:.2f})\n",
-                "err",
-            )
-            log_func(f"    → Theme audio not detected in search window\n", "err")
-        return None
-
-    # ═══════════════════════════════════════════
-    #  PHASE 2 — MEDIUM (SR=8000, ±15s)
-    # ═══════════════════════════════════════════
-    sr2     = 8000
-    window2 = 15.0
-
-    p2_start    = max(search_start_seconds, best_time1 - window2)
-    p2_end      = min(search_end_seconds, best_time1 + window2 + NEEDLE_DURATION_SECONDS)
-    p2_duration = max(1.0, p2_end - p2_start)
-
-    if log_func:
-        log_func(f"  [2/3] Refining (8kHz) {p2_start:.1f}s→{p2_end:.1f}s...\n", "dim")
-
-    needle2 = extract_audio_pcm(
-        theme_url,
-        start_seconds=NEEDLE_SKIP_SECONDS,
-        duration_seconds=NEEDLE_DURATION_SECONDS,
-        sample_rate=sr2,
-        log_func=log_func,
-    )
-
-    haystack2 = extract_audio_pcm(
-        video_path,
-        start_seconds=p2_start,
-        duration_seconds=p2_duration,
-        sample_rate=sr2,
-        log_func=log_func,
-    )
-
-    best_time2  = best_time1
-    best_score2 = best_score1
-
-    if needle2 is not None and haystack2 is not None:
-        if cancel_event and cancel_event.is_set():
-            return None
-
-        needle2 = needle2[:int(NEEDLE_DURATION_SECONDS * sr2)]
-        scores2    = compute_ncc_fft(needle2, haystack2)
-        best_idx2  = int(np.argmax(scores2))
-        best_score2 = float(scores2[best_idx2])
-        best_time2  = p2_start + best_idx2 / sr2
-
-        if log_func:
-            log_func(f"  [2/3] Best t={best_time2:.2f}s score={best_score2:.4f}\n", "dim")
-
-    if best_score2 < NCC_THRESHOLD * 0.7:
-        if log_func:
-            log_func(
-                f"  ✗ Low score after refining (score={best_score2:.4f} < {NCC_THRESHOLD * 0.7:.2f})\n",
-                "err",
-            )
-            log_func(f"    → Weak match, likely false positive\n", "err")
-        return None
-
-    # ═══════════════════════════════════════════
-    #  PHASE 3 — FINE (SR=16000, ±3s)
-    # ═══════════════════════════════════════════
-    sr3     = 16000
-    window3 = 3.0
-
-    p3_start    = max(search_start_seconds, best_time2 - window3)
-    p3_end      = min(search_end_seconds, best_time2 + window3 + NEEDLE_DURATION_SECONDS)
-    p3_duration = max(1.0, p3_end - p3_start)
-
-    if log_func:
-        log_func(f"  [3/3] Precision (16kHz) {p3_start:.1f}s→{p3_end:.1f}s...\n", "dim")
-
-    needle3 = extract_audio_pcm(
-        theme_url,
-        start_seconds=NEEDLE_SKIP_SECONDS,
-        duration_seconds=NEEDLE_DURATION_SECONDS,
-        sample_rate=sr3,
-        log_func=log_func,
-    )
-
-    haystack3 = extract_audio_pcm(
-        video_path,
-        start_seconds=p3_start,
-        duration_seconds=p3_duration,
-        sample_rate=sr3,
-        log_func=log_func,
-    )
-
-    best_time3  = best_time2
-    best_score3 = best_score2
-
-    if needle3 is not None and haystack3 is not None:
-        if cancel_event and cancel_event.is_set():
-            return None
-
-        needle3 = needle3[:int(NEEDLE_DURATION_SECONDS * sr3)]
-        scores3    = compute_ncc_fft(needle3, haystack3)
-        best_idx3  = int(np.argmax(scores3))
-        best_score3 = float(scores3[best_idx3])
-        best_time3  = p3_start + best_idx3 / sr3
-
-        if log_func:
-            log_func(f"  [3/3] Best t={best_time3:.3f}s score={best_score3:.4f}\n", "dim")
-
-    # ─── Final Result ──────────────────────────────────────────────────────────
-    if best_score3 >= NCC_THRESHOLD:
-        # Adjust for needle skip to get true start
-        true_start = best_time3 - NEEDLE_SKIP_SECONDS
-        true_start = max(search_start_seconds, true_start)
-        start_ms   = int(round(true_start * 1000))
-
-        confidence = "high" if best_score3 >= 0.55 else "medium"
-
-        if log_func:
-            log_func(
-                f"  Match [{confidence}] {ms_to_display(start_ms)} "
-                f"({true_start:.3f}s) score={best_score3:.4f}\n",
-                "ok",
-            )
-
         return start_ms
 
-    if log_func:
-        log_func(
-            f"  ✗ No match found. Best score={best_score3:.4f} < threshold={NCC_THRESHOLD}\n",
-            "err",
-        )
-        log_func(
-            f"    → Possible causes: wrong theme, different audio mix, or theme not in video\n",
-            "err",
-        )
-
+    log(
+        f"  ✗ No match found (score={raw_score:.0f} < required={required_score:.0f})\n",
+        "err",
+    )
     return None

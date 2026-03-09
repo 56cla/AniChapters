@@ -7,8 +7,12 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 from typing import Callable, Optional
+
+# Suppress console window on Windows (both native and PyInstaller .exe)
+_CREATIONFLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 from api_animethemes import get_anime_themes, search_anime
 from analyzer import analyze_video
@@ -58,10 +62,14 @@ class Application:
         self.busy = False
         self.inplace = tk.BooleanVar(value=False)
         self.cancel_event: Optional[threading.Event] = None
+        self.pause_event:  Optional[threading.Event] = None   # set = paused
+        self._paused = False
 
         self._build_ui()
         self._check_dependencies()
+        self._restore_ui_settings()
         threading.Thread(target=self._check_for_updates, daemon=True).start()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ─── UI construction ──────────────────────────────────────────────────────
 
@@ -293,6 +301,20 @@ class Application:
             command=self._cancel_operation,
         )
 
+        # Pause/Resume button (hidden initially)
+        self.btn_pause = tk.Button(
+            row,
+            text="⏸ Pause",
+            font=FONTB,
+            fg=BG,
+            bg=A4,
+            bd=0,
+            padx=10,
+            pady=6,
+            cursor="hand2",
+            command=self._toggle_pause,
+        )
+
     def _build_log_panel(self):
         frame = tk.Frame(self.root, bg=PANEL, highlightbackground=BORD, highlightthickness=1)
         frame.pack(fill="both", expand=True, padx=24, pady=10)
@@ -368,6 +390,25 @@ class Application:
         # Configure tags
         for tag, color in [("dim", DIM), ("ok", A2), ("err", A1), ("ch", A3), ("th", A4)]:
             self.log_text.tag_config(tag, foreground=color)
+
+    def _restore_ui_settings(self):
+        """Restore UI state (checkboxes, toggles) from saved settings."""
+        ui = self.settings.get("ui_state", {})
+        if ui.get("inplace", False):
+            if shutil.which("mkvpropedit"):
+                self.inplace.set(True)
+                self.btn_mux.config(text="[ 3 ]  In-place Edit", bg=A5)
+
+    def _save_ui_settings(self):
+        """Persist current UI state into settings.json."""
+        self.settings.setdefault("ui_state", {})
+        self.settings["ui_state"]["inplace"] = self.inplace.get()
+        save_settings(self.settings)
+
+    def _on_close(self):
+        """Save UI state then close the window."""
+        self._save_ui_settings()
+        self.root.destroy()
 
     # ─── Dependency check ─────────────────────────────────────────────────────
 
@@ -455,10 +496,15 @@ class Application:
         if busy:
             self.progress.start(12)
             if show_cancel:
-                self.btn_cancel.pack(side="left", padx=(0, 8))
+                self.btn_cancel.pack(side="left", padx=(0, 4))
+                self.btn_pause.pack(side="left", padx=(0, 8))
         else:
             self.progress.stop()
             self.btn_cancel.pack_forget()
+            self.btn_pause.pack_forget()
+            # Reset pause state when operation ends
+            self._paused = False
+            self.btn_pause.config(text="⏸ Pause", bg=A4)
 
     def _toggle_inplace(self):
         """Handle in-place editing toggle"""
@@ -478,6 +524,7 @@ class Application:
         else:
             self.btn_mux.config(text="[ 3 ]  Merge MKV", bg=A1)
             self._log("In-place editing disabled (mkvmerge)\n", "dim")
+        self._save_ui_settings()
 
     # ─── Video selection ──────────────────────────────────────────────────────
 
@@ -638,7 +685,7 @@ class Application:
         self._set_busy(False)
 
         # ── AniList ID resolution (background, non-blocking) ──────────────────
-        # Runs in a separate thread to avoid blocking the UI
+        # يجري في خيط منفصل حتى لا يُبطئ الواجهة
         threading.Thread(
             target=self._resolve_anilist_ids,
             args=(anime_name,),
@@ -647,8 +694,8 @@ class Application:
 
     def _resolve_anilist_ids(self, anime_name: str) -> None:
         """
-        Fetch anime_id and season_number from AniList and store them in self.db_meta.
-        Runs in the background — silent failure does not stop any feature.
+        اجلب anime_id وseason_number من AniList وخزّنهما في self.db_meta.
+        يعمل في الخلفية — الفشل الصامت لا يوقف أي وظيفة.
         """
         try:
             ids = resolve_anime_ids(anime_name)
@@ -669,7 +716,7 @@ class Application:
                     "dim",
                 )
         except Exception:
-            pass  # silent — AniList is optional
+            pass  # صامت تماماً — AniList اختياري
 
     # ─── Cancellation ─────────────────────────────────────────────────────────
 
@@ -677,7 +724,27 @@ class Application:
         """Cancel current operation"""
         if self.cancel_event:
             self.cancel_event.set()
-            self._log("\nCancellation requested...\n", "err")
+        # Also clear pause so the worker thread can exit cleanly
+        if self.pause_event:
+            self.pause_event.clear()
+        self._log("\nCancellation requested...\n", "err")
+
+    def _toggle_pause(self):
+        """Pause or resume the current analysis."""
+        if not self.pause_event:
+            return
+        if self._paused:
+            # Resume
+            self._paused = False
+            self.pause_event.clear()
+            self.btn_pause.config(text="⏸ Pause", bg=A4)
+            self._log("Resumed.\n", "ok")
+        else:
+            # Pause
+            self._paused = True
+            self.pause_event.set()
+            self.btn_pause.config(text="▶ Resume", bg=A2)
+            self._log("Paused — will stop after current file finishes.\n", "err")
 
     # ─── Analysis ─────────────────────────────────────────────────────────────
 
@@ -692,11 +759,21 @@ class Application:
 
         self._set_busy(True, show_cancel=True)
         self.cancel_event = threading.Event()
+        self.pause_event  = threading.Event()   # set = paused
         self.results      = []
         themes            = self.themes
 
         def run():
             for video_path in self.videos:
+                if self.cancel_event.is_set():
+                    break
+
+                # ── Pause: block here until resumed or cancelled ──────────────
+                while self.pause_event.is_set():
+                    if self.cancel_event.is_set():
+                        break
+                    threading.Event().wait(0.25)
+
                 if self.cancel_event.is_set():
                     break
 
@@ -789,12 +866,14 @@ class Application:
         self._log("\n", "dim")
         self._set_busy(False)
         self.cancel_event = None
+        self.pause_event  = None
 
     def _on_analysis_cancelled(self):
         """Handle analysis cancellation"""
         self._log("\nAnalysis cancelled.\n", "err")
         self._set_busy(False)
         self.cancel_event = None
+        self.pause_event  = None
 
     # ─── Review dialog ────────────────────────────────────────────────────────
 
@@ -805,6 +884,7 @@ class Application:
         if dialog.saved:
             from settings import load_settings
             self.settings = load_settings()
+            self._save_ui_settings()
             self._log("Settings saved.\n", "ok")
 
     def _review_chapters(self):
@@ -896,7 +976,8 @@ class Application:
                     self.root.after(0, self._log, f"  🔥 {result.basename}\n", "dim")
 
                     try:
-                        proc = subprocess.run(cmd, capture_output=True)
+                        proc = subprocess.run(cmd, capture_output=True,
+                                              creationflags=_CREATIONFLAGS)
                         if proc.returncode == 0:
                             self.root.after(
                                 0,
@@ -918,7 +999,8 @@ class Application:
                     self.root.after(0, self._log, f"  → {os.path.basename(output)}\n", "dim")
 
                     try:
-                        proc = subprocess.run(cmd, capture_output=True)
+                        proc = subprocess.run(cmd, capture_output=True,
+                                              creationflags=_CREATIONFLAGS)
                         if proc.returncode in (0, 1):
                             self.root.after(
                                 0,
@@ -1043,23 +1125,23 @@ class Application:
     # ─── Shared DB stats ─────────────────────────────────────────────────────
 
     def _show_db_stats(self) -> None:
-        """Display full stats and diagnostics for the shared database."""
+        """عرض إحصائيات + تشخيص كامل لقاعدة البيانات المشتركة."""
         import threading
         import remote_db as _rdb
 
         self._log("\n── Shared Database ─────────────────────────\n", "dim")
 
-        # Local cache stats (instant)
+        # إحصائيات الـ cache المحلي (فورية)
         try:
             db    = get_shared_db()
             stats = db.get_stats()
-            self._log(f"  💾 Local cache: {stats['cache_episodes']} episode(s)\n", "ok")
+            self._log(f"  💾 Cache محلي : {stats['cache_episodes']} حلقة\n", "ok")
             self._log(f"  💾 Cache path : {db.cache_path()}\n", "dim")
         except Exception as exc:
             self._log(f"  💾 Cache error: {exc}\n", "err")
 
-        # Supabase diagnostics in background (requires network)
-        self._log("  ☁  Checking Supabase…\n", "dim")
+        # تشخيص Supabase في الخلفية (يحتاج شبكة)
+        self._log("  ☁  جاري فحص Supabase…\n", "dim")
 
         def run_diagnose():
             try:

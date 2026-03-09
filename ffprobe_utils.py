@@ -6,7 +6,11 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 from typing import Optional
+
+# Suppress console window on Windows (both native and PyInstaller .exe)
+_CREATIONFLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
 def get_video_duration_ms(url: str) -> Optional[int]:
@@ -25,6 +29,7 @@ def get_video_duration_ms(url: str) -> Optional[int]:
             ],
             capture_output=True,
             timeout=30,
+            creationflags=_CREATIONFLAGS,
         )
 
         if result.returncode != 0:
