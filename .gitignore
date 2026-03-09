@@ -3,3 +3,6 @@ shared_chapters_cache.db
 *.db 
 __pycache__/ 
 *.pyc 
+dist/
+build/
+*.pyc
