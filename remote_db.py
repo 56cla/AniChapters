@@ -313,7 +313,7 @@ def upsert(
         "anime_title":    anime_title,
         "season_number":  season_number,
         "episode_number": episode_number,
-        # JSONB column: send as a list directly — PostgREST handles it as JSONB
+        # JSONB column: send as list directly — PostgREST handles it as JSONB
         "chapters_json":  serialize_chapters(chapters),
         "confidence":     confidence,
     }

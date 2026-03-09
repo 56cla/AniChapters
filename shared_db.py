@@ -1,16 +1,16 @@
 """
 shared_db.py — Shared Chapters Database Orchestrator  (v2 — Remote + Local Cache)
 
-تدفق العمل:
+Workflow:
   lookup(anime_id, season, episode)
-    ├── [1] تحقق من الـ cache المحلي (SQLite) — فوري
-    ├── [2] إذا لم يوجد → اتصل بـ Supabase (remote)
-    ├── [3] إذا وُجد remotely → احفظه في الـ cache المحلي → أعِده
-    └── [4] إذا لم يوجد في أي مكان → أعِد None (سيتم التحليل)
+    ├── [1] Check local cache (SQLite) — instant
+    ├── [2] If not found → connect to Supabase (remote)
+    ├── [3] If found remotely → save to local cache → return it
+    └── [4] If not found anywhere → return None (analysis will run)
 
   upsert(...)
-    ├── [1] ارفع إلى Supabase (remote) — أولاً وأهم
-    └── [2] احفظ في الـ cache المحلي — للاستخدام السريع لاحقاً
+    ├── [1] Upload to Supabase (remote) — first and most important
+    └── [2] Save to local cache — for fast access later
 """
 from __future__ import annotations
 
@@ -49,10 +49,10 @@ CREATE INDEX IF NOT EXISTS idx_cache_lookup
 
 class SharedDatabase:
     """
-    Orchestrator يجمع بين:
-      - remote_db  (Supabase) : المصدر الحقيقي المشترك بين جميع المستخدمين
-      - SQLite cache           : تسريع محلي، TTL = 30 يوم
-    جميع العمليات thread-safe. الفشل الصامت مضمون.
+    Orchestrator combining:
+      - remote_db  (Supabase) : the true shared source across all users
+      - SQLite cache          : local speed-up, TTL = 30 days
+    All operations are thread-safe. Silent failure is guaranteed.
     """
 
     def __init__(self, cache_path: str = _CACHE_PATH):
@@ -145,13 +145,13 @@ class SharedDatabase:
 
     def lookup(self, anime_id: int, season_number: int, episode_number: int) -> Optional[dict]:
         """
-        ابحث عن شابترات حلقة.
-        يُعيد dict: {"chapters": list[Chapter], "confidence", "use_count",
-                      "anime_title", "source": "cache"|"remote"}
-        أو None إذا لم تُوجد في أي مكان.
+        Look up chapters for an episode.
+        Returns dict: {"chapters": list[Chapter], "confidence", "use_count",
+                        "anime_title", "source": "cache"|"remote"}
+        or None if not found anywhere.
         """
         with self._lock:
-            # [1] Cache محلي
+            # [1] Local cache
             cached = self._cache_get(anime_id, season_number, episode_number)
             if cached:
                 chapters = self.deserialize_chapters(cached["chapters_json"])
@@ -172,7 +172,7 @@ class SharedDatabase:
             if not remote_row:
                 return None
 
-            # [3] احفظ في الـ cache المحلي
+            # [3] Save to local cache
             chapters_raw = remote_row.get("chapters_json", [])
             chapters_str = (
                 json.dumps(chapters_raw, ensure_ascii=False)
@@ -203,8 +203,8 @@ class SharedDatabase:
     def upsert(self, anime_id: int, anime_title: str, season_number: int,
                episode_number: int, chapters: list, confidence: str = "medium") -> bool:
         """
-        ارفع إلى Supabase المركزي + احفظ في الـ cache المحلي.
-        يُعيد True إذا نجح الرفع إلى Remote.
+        Upload to central Supabase + save to local cache.
+        Returns True if remote upload succeeded.
         """
         if not chapters:
             return False
@@ -213,18 +213,18 @@ class SharedDatabase:
         remote_ok     = False
 
         with self._lock:
-            # [1] Remote أولاً — remote_db.upsert() يُعيد (bool, error_str)
+            # [1] Remote first — remote_db.upsert() returns (bool, error_str)
             if remote_db.is_configured():
                 remote_ok, remote_err = remote_db.upsert(
                     anime_id=anime_id, anime_title=anime_title,
                     season_number=season_number, episode_number=episode_number,
                     chapters=chapters, confidence=confidence,
                 )
-                self._last_remote_error = remote_err  # للاستخدام في analyzer.py
+                self._last_remote_error = remote_err  # used in analyzer.py
             else:
                 self._last_remote_error = "Supabase not configured"
 
-            # [2] Cache دائماً بغض النظر عن نتيجة Remote
+            # [2] Cache always, regardless of remote result
             self._cache_set(
                 anime_id=anime_id, season_number=season_number,
                 episode_number=episode_number, anime_title=anime_title,

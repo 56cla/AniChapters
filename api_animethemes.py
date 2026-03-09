@@ -35,7 +35,7 @@ def parse_episode_set(episodes_str: str) -> set[int]:
 
     episodes: set[int] = set()
 
-    for part in re.split(r"[,،]", episodes_str):
+    for part in re.split(r"[,\u060c]", episodes_str):  # support ASCII and Arabic comma
         part = part.strip()
 
         # Range like "1-3" or "1–3"

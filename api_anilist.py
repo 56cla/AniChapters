@@ -1,19 +1,19 @@
 """
 api_anilist.py — AniList GraphQL Client
 
-يُستخدم فقط لجلب:
-  - anime_id     : المعرّف الرقمي في AniList (ثابت وفريد لكل أنمي)
-  - season_number: رقم الموسم المستنتَج من relations في AniList
+Used only to fetch:
+  - anime_id     : the numeric ID in AniList (stable and unique per anime)
+  - season_number: season number inferred from AniList relations
 
-لماذا AniList وليس animethemes.moe؟
-  animethemes.moe يستخدم slug نصياً (غير ثابت عند تغيير الاسم)،
-  بينما AniList ID رقم صحيح ثابت يصلح مفتاحاً أبدياً لقاعدة البيانات.
+Why AniList and not animethemes.moe?
+  animethemes.moe uses a text slug (unstable if the name changes),
+  while AniList ID is a stable integer — a permanent database key.
 
-الاستخدام:
+Usage:
     from api_anilist import resolve_anime_ids
 
     ids = resolve_anime_ids(anime_title="Fullmetal Alchemist Brotherhood", year=2009)
-    # ids = {"anime_id": 5114, "season_number": 1}   أو None عند الفشل
+    # ids = {"anime_id": 5114, "season_number": 1}   or None on failure
 """
 from __future__ import annotations
 
@@ -25,8 +25,8 @@ from typing import Optional
 ANILIST_API  = "https://graphql.anilist.co"
 _REQ_TIMEOUT = 12
 
-# ── الـ Query ─────────────────────────────────────────────────────────────────
-# نجلب المعرّف + العلاقات لاستنتاج رقم الموسم
+# ── Query ─────────────────────────────────────────────────────────────────────
+# Fetch ID + relations to infer season number
 _SEARCH_QUERY = """
 query ($search: String, $year: Int) {
   Media(search: $search, seasonYear: $year, type: ANIME, format_in: [TV, TV_SHORT]) {
@@ -53,7 +53,7 @@ query ($search: String, $year: Int) {
 }
 """
 
-# Query أبسط بدون year عند عدم توفره
+# Simpler query without year when not provided
 _SEARCH_QUERY_NO_YEAR = """
 query ($search: String) {
   Media(search: $search, type: ANIME, format_in: [TV, TV_SHORT]) {
@@ -72,11 +72,11 @@ query ($search: String) {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  دوال مساعدة داخلية
+#  Internal helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _anilist_request(query: str, variables: dict) -> Optional[dict]:
-    """أرسل طلب GraphQL وأعِد بيانات media أو None."""
+    """Send a GraphQL request and return media data or None."""
     payload = json.dumps({"query": query, "variables": variables}).encode()
     req = urllib.request.Request(
         ANILIST_API,
@@ -98,12 +98,12 @@ def _anilist_request(query: str, variables: dict) -> Optional[dict]:
 
 def _estimate_season_number(media: dict) -> int:
     """
-    استنتج رقم الموسم من علاقات AniList.
+    Infer season number from AniList relations.
 
-    المنطق:
-      - إذا كان الأنمي ليس له سابق (PREQUEL) → موسم 1
-      - عدد الـ PREQUEL relations + 1 = رقم الموسم
-      (تقريب معقول — AniList لا يخزن season_number صراحةً)
+    Logic:
+      - If the anime has no PREQUEL → season 1
+      - Number of PREQUEL relations + 1 = season number
+      (reasonable approximation — AniList does not store season_number explicitly)
     """
     relations = media.get("relations", {}).get("edges", [])
     prequel_count = sum(
@@ -117,7 +117,7 @@ def _estimate_season_number(media: dict) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  الواجهة العامة
+#  Public interface
 # ─────────────────────────────────────────────────────────────────────────────
 
 def resolve_anime_ids(
@@ -125,23 +125,23 @@ def resolve_anime_ids(
     year:        Optional[int] = None,
 ) -> Optional[dict]:
     """
-    ابحث في AniList عن الأنمي وأعِد:
+    Search AniList for the anime and return:
         {
             "anime_id":      <int>,   # AniList ID
-            "season_number": <int>,   # 1, 2, 3, …
-            "anime_title":   <str>,   # الاسم الرسمي
+            "season_number": <int>,   # 1, 2, 3, ...
+            "anime_title":   <str>,   # official title
         }
 
-    يُعيد None إذا فشل الطلب أو لم يُوجد نتيجة.
+    Returns None if the request fails or no result is found.
 
-    الأولوية:
-      1. يجرب مع سنة الإصدار إذا توفرت.
-      2. إذا فشل يجرب بدون السنة (fallback).
+    Priority:
+      1. Try with release year if provided.
+      2. If that fails, try without year (fallback).
     """
     if not anime_title or not anime_title.strip():
         return None
 
-    # ── محاولة مع السنة ───────────────────────────────────────────────────────
+    # ── Attempt with year ────────────────────────────────────────────────────
     if year:
         media = _anilist_request(
             _SEARCH_QUERY,
@@ -150,7 +150,7 @@ def resolve_anime_ids(
         if media:
             return _build_result(media)
 
-    # ── محاولة بدون السنة ────────────────────────────────────────────────────
+    # ── Attempt without year (fallback) ──────────────────────────────────────
     media = _anilist_request(
         _SEARCH_QUERY_NO_YEAR,
         {"search": anime_title},
@@ -162,7 +162,7 @@ def resolve_anime_ids(
 
 
 def _build_result(media: dict) -> dict:
-    """بنِ dict النتيجة من media object."""
+    """Build result dict from media object."""
     titles = media.get("title", {})
     title  = (
         titles.get("english")

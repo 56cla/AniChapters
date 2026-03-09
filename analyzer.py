@@ -249,7 +249,7 @@ def analyze_video(
     log(f"▶ {basename}\n", "ch")
     log(f"  Episode: {episode if episode is not None else '?'}\n", "dim")
 
-    # ── [1] Shared Database — check before analysis ───────────────────────────
+    # ── [1] Shared Database — check before analysis ──────────────────────────
     if db_meta and episode is not None:
         anime_id      = db_meta.get("anime_id")
         anime_title   = db_meta.get("anime_title", search_name or "Unknown")
@@ -375,7 +375,7 @@ def analyze_video(
     from chapters import write_chapters_xml
     write_chapters_xml(result.chapters, xml_path)
 
-    # ── [2] Shared Database — save after analysis ─────────────────────────────
+    # ── [2] Shared Database — save after analysis ────────────────────────────
     if anime_id and episode is not None and result.chapters:
         db         = get_shared_db()
         confidence = compute_confidence(result.op_source, result.ed_source)
