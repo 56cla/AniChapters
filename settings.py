@@ -1,15 +1,19 @@
-"""
-Chapter name settings: presets and persistence via settings.json
-"""
-from __future__ import annotations
-
+from pathlib import Path
 import json
 import os
 from typing import Optional
 
-# ── Settings file location (next to app) ──────────────────────────────────────
-_SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+def _get_settings_path() -> Path:
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        settings_dir = Path(appdata) / "AniChapters"
+    else:
+        settings_dir = Path.home() / ".anichapters"
 
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    return settings_dir / "settings.json"
+
+_SETTINGS_PATH = _get_settings_path()
 # ── Presets ───────────────────────────────────────────────────────────────────
 PRESETS: dict[str, dict[str, str]] = {
     "Default": {
