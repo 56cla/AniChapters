@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import sys
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -25,10 +26,14 @@ from models import Chapter, MatchSource
 import remote_db
 
 _CACHE_TTL_DAYS = 30
-_CACHE_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "shared_chapters_cache.db",
-)
+def _get_app_dir() -> str:
+    """Return the folder next to the .exe (PyInstaller) or next to this script."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+_CACHE_PATH = os.path.join(_get_app_dir(), "shared_chapters_cache.db")
 
 _CREATE_CACHE_SQL = """
 CREATE TABLE IF NOT EXISTS chapters_cache (
@@ -224,7 +229,7 @@ class SharedDatabase:
             else:
                 self._last_remote_error = "Supabase not configured"
 
-            # [2] Cache always, regardless of remote result
+            # [2] Always cache regardless of remote result
             self._cache_set(
                 anime_id=anime_id, season_number=season_number,
                 episode_number=episode_number, anime_title=anime_title,

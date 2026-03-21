@@ -1,53 +1,138 @@
-# Vendored from SubsPlus-Scripts/Auto_Chap/Auto_Chap.py v4.2
-# DO NOT MODIFY - keep identical to upstream logic.
-# Only changes: parse_args() removed (handled by wrapper); main() kept for reference.
-from __future__ import annotations
-
-import json
-import math
-import os
-import shutil
-import subprocess
 import sys
+import json
+import os
+import urllib
 import time
-import urllib.parse
 import warnings
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-
-# Suppress console window on Windows (both native and PyInstaller .exe)
-_CREATIONFLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+import argparse
+import shutil
+import math
 from pathlib import Path
-
-import numpy as np
 import requests
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+import librosa
+import audioread.ffdec
+import numpy as np
 from scipy import signal
+import matplotlib.pyplot as plt
 
-### Chapter Names (upstream)
-PRE_OP   = "Prologue"
-OPENING  = "Opening"
-EPISODE  = "Episode"
-ENDING   = "Ending"
-POST_ED  = "Epilogue"
+### Chapter Names
+PRE_OP = "Prologue"
+OPENING = "Opening"
+EPISODE = "Episode"
+ENDING = "Ending"
+POST_ED = "Epilogue"
 
+# Ignore librosa warnings about audioread. Try downgrading to librosa < 1.0 if it fully breaks
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Automatic anime chapter generator using AnimeThemes.")
+    parser.add_argument(
+        "--input", "-i", type=Path, required=True,
+        help="Video/Audio file.",
+    )
+
+    parser.add_argument(
+        "--output", "-o", type=Path,
+        help="Output chapter file. Defaults to where the episode is.",
+    )
+
+    parser.add_argument(
+        "--search-name", "-s", type=str,
+        help="Search to pass to animethemes.moe Example: Spy Classroom Season 2. To only use themes that are already downloaded, don't add this argument.",
+    )
+
+    parser.add_argument(
+        "--year", type=int,
+        help="Release year to help filter the search. Put the negative number to allow that year or later.",
+    )
+
+    parser.add_argument(
+        "--snap", type=int, nargs='?', const=1000, default=None,
+        help="Millisecond window to snap to nearest keyframe for frame-perfect chapters. Efficiently generates necessary keyframes from video. Defaults to 1000ms if no value added. Values higher than about 1000 currently crash.",
+    )
+
+    parser.add_argument(
+        "--episode-snap", type=float, default=4,
+        help="Window in seconds to snap chapters to the start or end of the episode. This gets applied at the very end. Defaults to 4."
+    )
+
+    parser.add_argument(
+        "--score", type=int, default=2000,
+        help="Score required for a theme to be accepted as a match. Increase it to reduce false positives, decrease it to be more lenient. Score is y-axis in charts divided by downsample factor. Defaults to 2000.",
+    )
+
+    parser.add_argument(
+        "--theme-portion", type=float, default=0.9,
+        help="Portion of a theme required in the episode to be a match. Keep below 1 so that it can still match themes that get slightly cut off. Defaults to 0.9."
+    )
+
+    parser.add_argument(
+        "--downsample", type=int, default=32,
+        help="Factor to downsample audio when matching, higher means speedier potentially with lower accuracy. Defaults to 32.",
+    )
+
+    parser.add_argument(
+        "--parallel-dl", type=int, default=10,
+        help="How many themes to download in parallel. Defaults to 10.",
+    )
+
+    parser.add_argument(
+        "--work-path", "-w", type=Path,
+        help="Place to create a .themes folder for storing persistent information per series. Defaults to where the episode is.",
+    )
+
+    parser.add_argument(
+        "--delete-themes", "-d", default=False, action="store_true",
+        help="Delete the themes and charts after running.",
+    )
+
+    parser.add_argument(
+        "--charts", "-c", default=False, action="store_true",
+        help="Make charts of where themes are matched in the episode. They can almost double processing time in some cases though.",
+    )
+
+    args = parser.parse_args()
+    args.no_download = False
+
+    if args.search_name is None:
+        args.no_download = True
+
+    if args.work_path is None:
+        args.work_path = Path(os.path.dirname(args.input))
+
+    if args.output is None:
+        args.output = args.input.with_name(args.input.stem + ".chapters.txt")
+
+    if args.snap is not None:
+        if args.snap > 1000:
+            print("Snap values higher than about 1000 currently crash SCXvid. Please lower it.", file=sys.stderr)
+            sys.exit(1)
+
+    if args.theme_portion <= 0:
+        print("Theme portion must be more than 0.", file=sys.stderr)
+        sys.exit(1)
+    elif args.theme_portion > 1:
+        print("Theme portion must be less than or equal to 1.", file=sys.stderr)
+        sys.exit(1)
+
+    args.episode_audio_path = None
+
+    return args
 
 def print_seperator():
     print("------------------------------")
-
 
 def make_folders(work_path):
     subdirectory_path = work_path / ".themes" / "charts"
     shutil.rmtree(subdirectory_path, ignore_errors=True)
     subdirectory_path.mkdir(parents=True)
 
-
 def get_series_json(args):
-    api_search_call = (
-        f"https://api.animethemes.moe/search?fields[search]=anime"
-        f"&q={urllib.parse.quote(args.search_name)}"
-    )
+    api_search_call = f"https://api.animethemes.moe/search?fields[search]=anime&q={urllib.parse.quote(args.search_name)}"
     if args.year:
         if args.year < 0:
             api_search_call += f"&filter[year-gte]={abs(args.year)}"
@@ -55,25 +140,19 @@ def get_series_json(args):
             api_search_call += f"&filter[year]={args.year}"
     global_search = requests.get(api_search_call).json()
     series_slug = global_search["search"]["anime"][0]["slug"]
-    series_json = requests.get(
-        f"https://api.animethemes.moe/anime/{series_slug}"
-        "?include=animethemes.animethemeentries.videos.audio"
-        "&fields[audio]=filename,updated_at,link"
-    ).json()
+    series_json = requests.get(f"https://api.animethemes.moe/anime/{series_slug}?include=animethemes.animethemeentries.videos.audio&fields[audio]=filename,updated_at,link").json()
     return series_json["anime"]
-
 
 def download_theme(t_path, theme_name, url):
     response = requests.get(url)
     if response.status_code == 200:
-        download_path = f"{t_path}/{theme_name}"
+        download_path = f'{t_path}/{theme_name}'
         download_path += ".ogg"
         with open(download_path, "wb") as file:
             file.write(response.content)
         print(f"{theme_name}: Downloaded     ", file=sys.stderr)
     else:
         print(f"Failed to download {theme_name}. Status code:", response.status_code, file=sys.stderr)
-
 
 def download_themes(t_path, args, series_json):
     try:
@@ -82,6 +161,7 @@ def download_themes(t_path, args, series_json):
     except Exception:
         stored_data = {}
 
+    # Reset themes if series different from last time
     if stored_data.get("series_name") != series_json["name"]:
         stored_data = {"series_name": series_json["name"]}
         files = os.listdir(t_path)
@@ -95,28 +175,27 @@ def download_themes(t_path, args, series_json):
     for theme in series_json["animethemes"]:
         audio_version = 1
         audio_links = []
-        cur_theme = theme["slug"]
+        cur_theme = theme["slug"] # OP1 or ED3, etc.
         if not cur_theme[-1].isdigit():
             cur_theme = cur_theme + "1"
-        for version in theme["animethemeentries"]:
+        for version in theme["animethemeentries"]: # Different video versions of theme
             full_cur_theme = cur_theme
             if audio_version > 1:
                 full_cur_theme += f"v{audio_version}"
             for video in version["videos"]:
-                if video["overlap"] != "None":
+                if video["overlap"] != "None": # No overs or transitions
                     continue
-                try:
-                    if (
-                        video["audio"]["updated_at"] == stored_data[full_cur_theme]["updated_at"]
-                        and video["audio"]["link"] not in audio_links
-                        and os.path.isfile(os.path.join(t_path, full_cur_theme + ".ogg"))
-                    ):
-                        audio_links.append(video["audio"]["link"])
-                        print(f"{full_cur_theme}: Found in directory", file=sys.stderr)
-                        audio_version += 1
-                        break
+                try: # Look to see if it is in data.json or needs an update
+                    if video["audio"]["updated_at"] == stored_data[full_cur_theme]["updated_at"] and \
+                        video["audio"]["link"] not in audio_links and \
+                        os.path.isfile(os.path.join(t_path, full_cur_theme + ".ogg")):
+                            audio_links.append(video["audio"]["link"])
+                            print(f"{full_cur_theme}: Found in directory", file=sys.stderr)
+                            audio_version += 1
+                            break
                 except Exception:
                     pass
+                # Add to data.json
                 stored_data[full_cur_theme] = {}
                 stored_data[full_cur_theme]["updated_at"] = video["audio"]["updated_at"]
                 stored_data[full_cur_theme]["animethemes_filename"] = video["audio"]["filename"]
@@ -129,24 +208,19 @@ def download_themes(t_path, args, series_json):
         print("Downloading themes...")
 
     with ThreadPoolExecutor(max_workers=args.parallel_dl) as executor:
-        future_to_url = {
-            executor.submit(download_theme, t_path, theme, url): (theme, url)
-            for (theme, url) in need_download
-        }
+        future_to_url = {executor.submit(download_theme, t_path, theme, url): (theme, url) for (theme, url) in need_download}
         for future in as_completed(future_to_url):
             url = future_to_url[future]
             try:
-                future.result()
+                data = future.result()
             except Exception as exc:
                 print(f"{url} generated an exception: {exc}", file=sys.stderr)
 
     with open(os.path.join(t_path, "data.json"), "w") as outfile:
         json.dump(stored_data, outfile, indent=4)
 
-
 def generate_chart(theme_name, c, t_path, matched=True):
     try:
-        import matplotlib.pyplot as plt
         fig, ax = plt.subplots()
         ax.plot(c)
     except Exception as exc:
@@ -164,11 +238,7 @@ def generate_chart(theme_name, c, t_path, matched=True):
 
     print(f"{theme_name}: Chart generated")
 
-
 def find_offset(y_episode, sr_episode, theme_file, t_path, args):
-    import audioread.ffdec
-    import librosa
-
     theme_name = os.path.splitext(theme_file.name)[0]
 
     try:
@@ -178,18 +248,17 @@ def find_offset(y_episode, sr_episode, theme_file, t_path, args):
         print(f"{theme_name}: Could not load theme file - {exc}", file=sys.stderr)
         sys.exit(1)
 
-    y_episode_ds = y_episode[::args.downsample]
-    y_theme_ds   = y_theme[::args.downsample]
+    y_episode= y_episode[::args.downsample]
+    y_theme = y_theme[::args.downsample]
 
+    # 5 secs silence prepended to fix matches at the beginning of episode
     silence_length = int(5 * sr_episode / args.downsample)
-    y_episode_adjust = np.empty(silence_length + len(y_episode_ds), dtype=y_episode_ds.dtype)
+    y_episode_adjust = np.empty(silence_length + len(y_episode), dtype=y_episode.dtype)
     y_episode_adjust[:silence_length] = 0
-    y_episode_adjust[silence_length:] = y_episode_ds
+    y_episode_adjust[silence_length:] = y_episode
 
     duration = librosa.get_duration(path=str(theme_file))
-    y_theme_first_portion = y_theme_ds[
-        : int(sr_episode * ((duration + 5) * args.theme_portion) / args.downsample)
-    ]
+    y_theme_first_portion = y_theme[:int(sr_episode * ((duration + 5) * args.theme_portion) / args.downsample)]
 
     try:
         c = signal.correlate(y_episode_adjust, y_theme_first_portion, mode="valid", method="auto")
@@ -204,14 +273,12 @@ def find_offset(y_episode, sr_episode, theme_file, t_path, args):
     offset = max(round((match_idx - silence_length) / (sr_episode / args.downsample), 2), 0)
 
     if score > required_score:
-        print(
-            f"{theme_name}: Matched from {get_timestamp(offset)} -> {get_timestamp(offset + duration)}",
-            file=sys.stderr,
-        )
+        print(f"{theme_name}: Matched from {get_timestamp(offset)} -> {get_timestamp(offset + duration)}", file=sys.stderr)
         if args.charts:
             with ProcessPoolExecutor() as executor:
                 executor.submit(generate_chart, theme_name, c, t_path, True)
         return offset, (offset + duration)
+
     else:
         print(f"{theme_name}: Not matched", file=sys.stderr)
         if args.charts:
@@ -219,13 +286,9 @@ def find_offset(y_episode, sr_episode, theme_file, t_path, args):
                 executor.submit(generate_chart, theme_name, c, t_path, False)
         return None, None
 
-
 def get_timestamp(timesec):
-    timestamp = time.strftime(
-        f"%H:%M:%S.{round(timesec % 1 * 1000):03}", time.gmtime(timesec)
-    )
+    timestamp = time.strftime(f"%H:%M:%S.{round(timesec%1*1000):03}", time.gmtime(timesec))
     return timestamp
-
 
 def chapter_validator(offset_list, file_duration):
     if len(offset_list) == 0:
@@ -249,7 +312,6 @@ def chapter_validator(offset_list, file_duration):
         print_seperator()
         print("Chapters not valid. Invalid number of offsets", file=sys.stderr)
         return False
-
 
 def generate_chapters(offset_list, file_duration, args):
     outfile = open(args.output, "w", encoding="utf-8")
@@ -301,7 +363,6 @@ def generate_chapters(offset_list, file_duration, args):
 
     outfile.close()
 
-
 def validate_themes(args, t_path):
     if args.no_download:
         valid = False
@@ -312,7 +373,6 @@ def validate_themes(args, t_path):
         if not valid:
             print("No valid themes. Specify a search-name to download themes.", file=sys.stderr)
             sys.exit(1)
-
 
 def try_download(args, t_path):
     if not args.no_download:
@@ -326,7 +386,6 @@ def try_download(args, t_path):
         except Exception as exc:
             print(f"\rCouldn't access api or download: {exc}", file=sys.stderr)
 
-
 def extract_episode_audio(args):
     file_path = args.input
 
@@ -338,15 +397,12 @@ def extract_episode_audio(args):
 
     if str(file_path).endswith(".mkv"):
         print("Extracting episode audio...", end="", flush=True)
-        output = subprocess.run(
-            [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-n", "-i",
-                file_path, "-map", "0:a:0", extract_path,
-            ],
-            capture_output=True,
-            creationflags=_CREATIONFLAGS,
-        )
-        if len(output.stderr) > 0:
+        # Extract as a temp wav file
+        output = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-n", "-i",
+                                 file_path, "-map", "0:a:0", extract_path], capture_output=True,
+                                creationflags=_CREATIONFLAGS)
+        # Check returncode — ffmpeg always writes to stderr even on success
+        if output.returncode != 0:
             print("\rextraction error          ", file=sys.stderr)
             print(output.stderr.decode())
             sys.exit(1)
@@ -356,29 +412,22 @@ def extract_episode_audio(args):
     else:
         args.episode_audio_path = str(args.input)
 
-
 def process_themes(t_path, args, theme_files, theme_type, y_episode, sr_episode):
-    matched_flag = False
-    local_offset_list = []
-    for (theme_name, theme_path) in theme_files:
-        if theme_type in theme_name and matched_flag:
-            print(
-                f"{theme_name}: Skipping because already matched an {theme_type}",
-                file=sys.stderr,
-            )
-            continue
-        offset1, offset2 = find_offset(y_episode, sr_episode, theme_path, t_path, args)
-        if offset1 is not None:
-            matched_flag = True
-            local_offset_list.append(offset1)
-            local_offset_list.append(offset2)
+        matched_flag = False
+        local_offset_list = []
+        for (theme_name, theme_path) in theme_files:
+            if theme_type in theme_name and matched_flag:
+                print(f"{theme_name}: Skipping because already matched an {theme_type}", file=sys.stderr)
+                continue
+            offset1, offset2 = find_offset(y_episode, sr_episode, theme_path, t_path, args)
+            if offset1 is not None:
+                matched_flag = True
+                local_offset_list.append(offset1)
+                local_offset_list.append(offset2)
 
-    return local_offset_list
-
+        return local_offset_list
 
 def match_themes(args, t_path):
-    import librosa
-
     op_files = []
     ed_files = []
     for theme_file in os.scandir(t_path):
@@ -396,10 +445,7 @@ def match_themes(args, t_path):
     try:
         y_episode, sr_episode = librosa.load(str(args.episode_audio_path), sr=None)
     except Exception as exc:
-        print(
-            f"Could not load input file - {str(args.episode_audio_path)}: {exc}",
-            file=sys.stderr,
-        )
+        print(f"Could not load input file - {str(args.episode_audio_path)}: {exc}", file=sys.stderr)
         sys.exit(1)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -411,16 +457,14 @@ def match_themes(args, t_path):
 
     return offset_list
 
-
-def time_to_frame(timesec, framerate, floor=True):
+def time_to_frame(timesec, framerate, floor = True):
     frame = timesec * framerate
     if floor:
         return math.floor(frame)
     else:
         return math.ceil(frame)
 
-
-def frame_to_time(frame, framerate, floor=True):
+def frame_to_time(frame, framerate, floor = True):
     if floor:
         middle_frame = max(0, frame - 0.5)
     else:
@@ -429,7 +473,6 @@ def frame_to_time(frame, framerate, floor=True):
     secs = middle_frame / framerate
 
     return secs
-
 
 def generate_search_pattern(window):
     result = [window + 1]
@@ -440,20 +483,19 @@ def generate_search_pattern(window):
 
     return result
 
-
 def get_keyframe_frame(frame, snap_window_frames, clip_length, clip, core):
+    # Generate the keyframes in range with one more at the beginning since the first is always keyframe
+    # Scxvid needs to go sequentially and wwxd is inaccurate in testing
     search_start_frame = max(frame - snap_window_frames - 1, 0)
-    search_end_frame = min(frame + snap_window_frames, clip_length)
+    search_end_frame = min(frame + snap_window_frames, clip_length) # Should already be one more than the last index
     if search_start_frame >= search_end_frame:
         return
     trimmed_clip = clip[search_start_frame:search_end_frame]
     try:
         scxvid_clip = core.scxvid.Scxvid(trimmed_clip)
     except Exception:
-        raise ImportError(
-            "You need to install Scxvid in vapoursynth plugins\n"
-            "https://github.com/dubhater/vapoursynth-scxvid"
-        )
+        raise ImportError("You need to install Scxvid in vapoursynth plugins\n"
+                          "https://github.com/dubhater/vapoursynth-scxvid")
 
     search_pattern = generate_search_pattern(snap_window_frames)
     for i in search_pattern:
@@ -465,24 +507,19 @@ def get_keyframe_frame(frame, snap_window_frames, clip_length, clip, core):
         if scenechange:
             return actual_frame
 
-
 def snap(args, offset_list):
     try:
         import vapoursynth as vs
         from vapoursynth import core
     except Exception:
-        raise ImportError(
-            "You need to install in vapoursynth for snapping\n"
-            "https://github.com/vapoursynth/vapoursynth"
-        )
+        raise ImportError("You need to install in vapoursynth for snapping\n"
+                          "https://github.com/vapoursynth/vapoursynth")
 
     try:
         clip = core.ffms2.Source(source=args.input, cache=False)
     except Exception:
-        raise ImportError(
-            "Could not load video or you haven't installed ffms2 in vapoursynth plugins for snapping\n"
-            "https://github.com/FFMS/ffms2"
-        )
+        raise ImportError("Could not load video or you haven't installed ffms2 in vapoursynth plugins for snapping\n"
+                          "https://github.com/FFMS/ffms2")
 
     print(f"Snapping chapters...", end="", flush=True)
 
@@ -493,7 +530,7 @@ def snap(args, offset_list):
 
     snapped_offsets = []
     for offset in offset_list:
-        offset_frame = time_to_frame(offset, fps, floor=False)
+        offset_frame =  time_to_frame(offset, fps, floor=False)
         snap_window_frames = round(args.snap / 1000 * fps)
         snap_frame = get_keyframe_frame(offset_frame, snap_window_frames, clip_length, clip, core)
 
@@ -504,10 +541,10 @@ def snap(args, offset_list):
 
     return snapped_offsets
 
-
 def print_snapped_times(offset_list, file_duration, args):
     print("\rSnapped times:        ", file=sys.stderr)
 
+    # Episode duration snapping
     ep_snapped_offsets = offset_list.copy()
     if ep_snapped_offsets[0] < args.episode_snap:
         ep_snapped_offsets[0] = 0
@@ -515,25 +552,13 @@ def print_snapped_times(offset_list, file_duration, args):
     if ep_snapped_offsets[-1] > (file_duration - args.episode_snap):
         ep_snapped_offsets[-1] = file_duration
 
-    print(
-        f"{get_timestamp(ep_snapped_offsets[0])} -> {get_timestamp(ep_snapped_offsets[1])}",
-        file=sys.stderr,
-    )
+    print(f"{get_timestamp(ep_snapped_offsets[0])} -> {get_timestamp(ep_snapped_offsets[1])}", file=sys.stderr)
 
     if len(ep_snapped_offsets) == 4:
-        print(
-            f"{get_timestamp(ep_snapped_offsets[2])} -> {get_timestamp(ep_snapped_offsets[3])}",
-            file=sys.stderr,
-        )
+        print(f"{get_timestamp(ep_snapped_offsets[2])} -> {get_timestamp(ep_snapped_offsets[3])}", file=sys.stderr)
 
-
-def run_autochap(args):
-    """
-    Execute Auto_Chap pipeline given a pre-built args namespace.
-    Equivalent to upstream main() without parse_args().
-    """
-    import librosa
-
+def main():
+    args = parse_args()
     t_path = os.path.join(args.work_path, ".themes")
 
     try:
@@ -556,7 +581,50 @@ def run_autochap(args):
         if args.delete_themes:
             shutil.rmtree(t_path)
         try:
-            if args.episode_audio_path and str(args.episode_audio_path).endswith(".autochap.wav"):
+            if args.episode_audio_path.endswith(".autochap.wav"):
                 os.remove(args.episode_audio_path)
         except Exception:
             pass
+
+
+# ── Suppress console windows on Windows ──────────────────────────────────────
+_CREATIONFLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+def run_autochap(args) -> None:
+    """
+    Entry point called by analyzer.py.
+    Accepts a pre-built args namespace (same fields as parse_args() produces).
+    Runs the full Auto_Chap pipeline: download themes, match, write chapters.
+    """
+    t_path = os.path.join(args.work_path, ".themes")
+
+    try:
+        if not getattr(args, "no_download", False):
+            series_json = get_series_json(args)
+            if series_json is not None:
+                try_download(args, t_path)
+        else:
+            validate_themes(args, t_path)
+
+        extract_episode_audio(args)
+
+        offset_list = match_themes(args, t_path)
+
+        file_duration = librosa.get_duration(path=str(args.episode_audio_path))
+
+        offset_list.sort()
+        if chapter_validator(offset_list, file_duration):
+            if getattr(args, "snap", None):
+                offset_list = snap(args, offset_list)
+            generate_chapters(offset_list, file_duration, args)
+    finally:
+        if getattr(args, "delete_themes", False):
+            shutil.rmtree(t_path, ignore_errors=True)
+        try:
+            if str(args.episode_audio_path).endswith(".autochap.wav"):
+                os.remove(args.episode_audio_path)
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    main()

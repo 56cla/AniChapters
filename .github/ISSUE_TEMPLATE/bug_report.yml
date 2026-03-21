@@ -1,0 +1,88 @@
+name: Bug Report
+description: Report a bug in the Python app
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      description: Please follow the general troubleshooting steps first.
+      options:
+        - label: My version of the app is the latest available
+          required: true
+        - label: I have checked open and closed issues
+          required: true
+        - label: I have checked the docs for a fix
+          required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Bug Severity
+      description: Select the severity of the bug. Anything below Panic means the app does not crash.
+      options:
+        - Low
+        - Medium
+        - High
+        - Critical
+        - Panic
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Bug Area
+      description: Select the area where the bug occurred.
+      options:
+        - Installation
+        - Startup
+        - CLI
+        - GUI
+        - Configuration
+        - File Processing
+        - Performance
+        - Logging
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Bug Description / Steps to Reproduce
+      description: Precisely describe the bug and the steps to reproduce it.
+      placeholder: |
+        1. Run the app
+        2. Open ...
+        3. Click ...
+        4. The error appears
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: Describe what you expected to happen.
+      placeholder: The app should ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots
+      description: If applicable, add screenshots.
+      placeholder: Paste screenshots or image links here.
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Add terminal output, stack traces, or related logs.
+      placeholder: Paste logs here
+      render: shell
+    validations:
+      required: true

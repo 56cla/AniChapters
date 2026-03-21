@@ -7,7 +7,11 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
+
+# Suppress console windows on Windows when spawning subprocesses
+_CREATIONFLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 from typing import Callable, Optional
 
 from api_animethemes import get_anime_themes, search_anime
@@ -34,7 +38,7 @@ try:
 except ImportError:
     GUI_AVAILABLE = False
 
-CURRENT_VERSION = "2.0"
+CURRENT_VERSION = "5.0"
 GITHUB_REPO     = "56cla/AniChapters"
 
 
@@ -896,7 +900,7 @@ class Application:
                     self.root.after(0, self._log, f"  🔥 {result.basename}\n", "dim")
 
                     try:
-                        proc = subprocess.run(cmd, capture_output=True)
+                        proc = subprocess.run(cmd, capture_output=True, creationflags=_CREATIONFLAGS)
                         if proc.returncode == 0:
                             self.root.after(
                                 0,
@@ -918,7 +922,7 @@ class Application:
                     self.root.after(0, self._log, f"  → {os.path.basename(output)}\n", "dim")
 
                     try:
-                        proc = subprocess.run(cmd, capture_output=True)
+                        proc = subprocess.run(cmd, capture_output=True, creationflags=_CREATIONFLAGS)
                         if proc.returncode in (0, 1):
                             self.root.after(
                                 0,
