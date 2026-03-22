@@ -285,32 +285,49 @@ def analyze_video(
                 episode_number=episode,
             )
             if cached_row:
-                # cached_row["chapters"] is a ready list[Chapter] from the orchestrator
                 cached_chapters = cached_row.get("chapters", [])
                 if cached_chapters:
-                    src_label = cached_row.get("source", "db")
-                    log(
-                        f"  [DB] ✔ Found in shared DB ({src_label})"
-                        f" confidence={cached_row['confidence']}"
-                        f" used={cached_row['use_count']}x\n",
-                        "ok",
+                    # Validate DB result — if no OP and no ED detected,
+                    # the entry is likely incomplete. Skip and re-analyze.
+                    # Check if the DB result has an Opening chapter.
+                    # If not, the entry is incomplete (e.g. only Episode+Ending).
+                    ch_names_lower = {ch.name.lower() for ch in cached_chapters}
+                    has_op = any(
+                        "opening" in n or n.startswith("op")
+                        for n in ch_names_lower
                     )
-                    log("  [DB] Skipping audio analysis — loading from DB\n", "ok")
+                    # Only trust the DB if OP was found
+                    suspicious = not has_op
 
-                    # Build a full AnalysisResult from the cached chapters
-                    xml_path = os.path.splitext(video_path)[0] + "_chapters.xml"
-                    result   = _result_from_cached_chapters(
-                        video_path, cached_chapters, xml_path, video_duration_ms,
-                    )
+                    if suspicious:
+                        log(
+                            "  [DB] \u26a0 Result looks incomplete (no OP or ED) "
+                            "\u2014 skipping DB and re-analyzing.\n",
+                            "err",
+                        )
+                        db.invalidate_episode(anime_id, season_number, episode)
+                    else:
+                        src_label = cached_row.get("source", "db")
+                        log(
+                            f"  [DB] \u2714 Found in shared DB ({src_label})"
+                            f" confidence={cached_row['confidence']}"
+                            f" used={cached_row['use_count']}x\n",
+                            "ok",
+                        )
+                        log("  [DB] Skipping audio analysis \u2014 loading from DB\n", "ok")
 
-                    from chapters import write_chapters_xml
-                    write_chapters_xml(result.chapters, xml_path)
+                        xml_path = os.path.splitext(video_path)[0] + "_chapters.xml"
+                        result   = _result_from_cached_chapters(
+                            video_path, cached_chapters, xml_path, video_duration_ms,
+                        )
 
-                    # Log the chapters
-                    for ch in cached_chapters:
-                        log(f"    {ms_to_display(ch.timestamp_ms)}  →  {ch.name}\n", "ch")
+                        from chapters import write_chapters_xml
+                        write_chapters_xml(result.chapters, xml_path)
 
-                    return result
+                        for ch in cached_chapters:
+                            log(f"    {ms_to_display(ch.timestamp_ms)}  \u2192  {ch.name}\n", "ch")
+
+                        return result
 
             log("  [DB] Not found — proceeding with audio analysis\n", "dim")
     else:
@@ -318,7 +335,7 @@ def analyze_video(
         anime_title   = search_name or "Unknown"
         season_number = 1
 
-    # ── temp output paths ─────────────────────────────────────────────────────
+    # Output paths — defined here so they're always available regardless of DB path
     chapters_txt = os.path.splitext(video_path)[0] + ".autochap_tmp.txt"
     xml_path     = os.path.splitext(video_path)[0] + "_chapters.xml"
 
@@ -432,4 +449,3 @@ def analyze_video(
             log("  [DB]   Click 'DB STATS' for full diagnostics\n", "dim")
 
     return result
-

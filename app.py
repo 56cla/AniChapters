@@ -240,6 +240,7 @@ class Application:
         )
         self.btn_analyze.pack(side="left", padx=(0, 8))
 
+
         self.btn_review = tk.Button(
             row,
             text="[ 2 ]  Review",
