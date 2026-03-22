@@ -148,6 +148,23 @@ class SharedDatabase:
         except Exception:
             pass
 
+    def invalidate_episode(self, anime_id: int, season_number: int, episode_number: int) -> bool:
+        """
+        Delete a single episode from the local cache so it will be re-analyzed.
+        Does NOT touch the remote Supabase DB — only clears local cache.
+        Returns True if a row was deleted.
+        """
+        try:
+            with self._connect_cache() as conn:
+                cur = conn.execute(
+                    "DELETE FROM chapters_cache "
+                    "WHERE anime_id=? AND season_number=? AND episode_number=?",
+                    (anime_id, season_number, episode_number),
+                )
+                return cur.rowcount > 0
+        except Exception:
+            return False
+
     def lookup(self, anime_id: int, season_number: int, episode_number: int) -> Optional[dict]:
         """
         Look up chapters for an episode.
