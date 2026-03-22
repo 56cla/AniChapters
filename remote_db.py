@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import urllib.error
 import urllib.parse
@@ -35,13 +36,22 @@ def _load_config() -> tuple[str, str]:
       2. Environment variables SUPABASE_URL / SUPABASE_KEY
     Returns ("", "") if no config found.
     """
-    # Attempt 1: supabase_config.py
+    # Attempt 1: supabase_config.py — parsed safely without exec()
+    # Reads lines of the form:  SUPABASE_URL = "https://..."
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "supabase_config.py")
     if os.path.exists(config_path):
-        cfg: dict = {}
         try:
-            with open(config_path, encoding="utf-8") as f:
-                exec(f.read(), cfg)  # noqa: S102
+            cfg: dict[str, str] = {}
+            with open(config_path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.split("#")[0].strip()
+                    if "=" not in line:
+                        continue
+                    k, _, v = line.partition("=")
+                    k = k.strip()
+                    v = v.strip().strip("'\"")
+                    if k in ("SUPABASE_URL", "SUPABASE_KEY"):
+                        cfg[k] = v
             url = cfg.get("SUPABASE_URL", "").strip().rstrip("/")
             key = cfg.get("SUPABASE_KEY", "").strip()
             if url and key:

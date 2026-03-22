@@ -598,6 +598,9 @@ def run_autochap(args) -> None:
     """
     t_path = os.path.join(args.work_path, ".themes")
 
+    # Ensure .themes and .themes/charts folders exist before any download/read
+    make_folders(args.work_path)
+
     try:
         if not getattr(args, "no_download", False):
             series_json = get_series_json(args)

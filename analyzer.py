@@ -2,12 +2,29 @@
 High-level video analysis: bridges the GUI (app.py) with the Auto_Chap v4.2
 engine (core.py).
 
-All matching logic lives in core.py — untouched.
+Architecture note — dual theme-fetch path (intentional):
+  app.py fetches themes from animethemes.moe once and displays them in the GUI
+  (labels, durations, episode sets). This is the "display path".
+
+  core.py independently re-fetches and downloads the same themes as .ogg files
+  into a .themes/ folder for audio correlation. This is the "analysis path".
+
+  Why not unify? core.py requires .ogg files on disk for librosa — it cannot
+  accept Theme objects directly. Merging the paths would require rewriting
+  core.py's download + correlation logic, which is intentionally kept as-is
+  (upstream Auto_Chap v4.2). The duplication is a known architectural smell,
+  documented here to prevent confusion.
+
+  Practical impact: themes are downloaded twice on first run, then cached in
+  .themes/ and reused. The overhead is acceptable.
+
 This file only:
-  1. Builds the args namespace that core.py expects.
-  2. Calls core.run_autochap().
-  3. Reads the resulting .chapters.txt and converts it to an AnalysisResult
+  1. Checks the Shared Database before analysis (short-circuit if found).
+  2. Builds the args namespace that core.py expects.
+  3. Calls core.run_autochap().
+  4. Reads the resulting .chapters.txt and converts it to an AnalysisResult
      that the rest of the GUI (chapters.py, dialogs.py, …) can consume.
+  5. Saves results to the Shared Database after analysis.
 """
 from __future__ import annotations
 

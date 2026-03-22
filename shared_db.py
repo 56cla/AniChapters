@@ -154,16 +154,32 @@ class SharedDatabase:
         Returns dict: {"chapters": list[Chapter], "confidence", "use_count",
                         "anime_title", "source": "cache"|"remote"}
         or None if not found anywhere.
+
+        Cache policy:
+          - High/medium confidence cache hits are returned immediately (fast path).
+          - Low/fallback confidence cache hits still check remote for a better entry.
+            If remote has something better (higher confidence), it replaces the cache.
         """
         with self._lock:
             # [1] Local cache
             cached = self._cache_get(anime_id, season_number, episode_number)
             if cached:
                 chapters = self.deserialize_chapters(cached["chapters_json"])
-                if chapters:
+                cached_conf = cached.get("confidence", "medium")
+                # Fast path: trust high/medium confidence cache entries
+                if chapters and cached_conf in ("high", "medium"):
                     return {
                         "chapters":    chapters,
-                        "confidence":  cached["confidence"],
+                        "confidence":  cached_conf,
+                        "use_count":   cached["use_count"],
+                        "anime_title": cached["anime_title"],
+                        "source":      "cache",
+                    }
+                # For low/fallback confidence: check if remote has a better entry
+                if chapters and not remote_db.is_configured():
+                    return {
+                        "chapters":    chapters,
+                        "confidence":  cached_conf,
                         "use_count":   cached["use_count"],
                         "anime_title": cached["anime_title"],
                         "source":      "cache",

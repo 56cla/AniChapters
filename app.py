@@ -38,7 +38,20 @@ try:
 except ImportError:
     GUI_AVAILABLE = False
 
-CURRENT_VERSION = "5.0"
+CURRENT_VERSION = "6.0"
+
+
+def _version_gt(latest: str, current: str) -> bool:
+    """
+    Return True if latest > current using tuple comparison.
+    Handles formats: "6.0", "5.0.1", "v5.0" (v-prefix stripped by caller).
+    """
+    def _parse(v: str) -> tuple:
+        try:
+            return tuple(int(x) for x in v.lstrip("v").split("."))
+        except ValueError:
+            return (0,)
+    return _parse(latest) > _parse(current)
 GITHUB_REPO     = "56cla/AniChapters"
 
 
@@ -418,8 +431,8 @@ class Application:
             req = urllib.request.Request(url, headers={"User-Agent": "AniChapters"})
             with urllib.request.urlopen(req, timeout=8) as resp:
                 data = json.loads(resp.read().decode())
-            latest = data.get("tag_name", "").strip()
-            if latest and latest != CURRENT_VERSION:
+            latest = data.get("tag_name", "").strip().lstrip("v")
+            if latest and _version_gt(latest, CURRENT_VERSION):
                 self.root.after(0, self._show_update_popup, latest, data.get("html_url", ""))
             else:
                 self.root.after(0, self._log, f"Version {CURRENT_VERSION} — up to date.\n", "dim")
@@ -612,19 +625,30 @@ class Application:
             try:
                 themes = get_anime_themes(slug, self._log_async)
 
-                for theme in themes:
+                # Fetch durations in parallel — much faster with multiple themes
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                def _fetch_duration(theme):
                     self.root.after(0, self._log, f"  ffprobe ← {theme.label}...\n", "dim")
                     theme.duration_ms = get_video_duration_ms(theme.video_url)
+                    return theme
 
-                    dur_s = f"{theme.duration_ms // 1000}s" if theme.duration_ms else "N/A"
-                    eps   = sorted(theme.episode_set) if theme.episode_set else []
-
-                    self.root.after(
-                        0,
-                        self._log,
-                        f"  {theme.label} \"{theme.title}\" {dur_s} eps={eps or 'all'}\n",
-                        "th",
-                    )
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    futures = {pool.submit(_fetch_duration, t): t for t in themes}
+                    for future in as_completed(futures):
+                        theme = futures[future]
+                        try:
+                            future.result()
+                        except Exception:
+                            pass
+                        dur_s = f"{theme.duration_ms // 1000}s" if theme.duration_ms else "N/A"
+                        eps   = sorted(theme.episode_set) if theme.episode_set else []
+                        self.root.after(
+                            0,
+                            self._log,
+                            f"  {theme.label} \"{theme.title}\" {dur_s} eps={eps or 'all'}\n",
+                            "th",
+                        )
 
                 self.root.after(0, self._on_themes_loaded, themes, name)
             except Exception as e:
